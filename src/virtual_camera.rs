@@ -381,6 +381,7 @@ struct Shared {
     frame: Mutex<Option<InputFrame>>,
     wake: Condvar,
     converted: Mutex<std::collections::VecDeque<PreparedFrame>>,
+    conversion_scratch: Mutex<Vec<u8>>,
     sequence: AtomicU64,
     metrics: Mutex<OutputMetrics>,
     status: Mutex<String>,
@@ -395,6 +396,7 @@ impl Shared {
             frame: Mutex::new(None),
             wake: Condvar::new(),
             converted: Mutex::new(std::collections::VecDeque::new()),
+            conversion_scratch: Mutex::new(Vec::new()),
             sequence: AtomicU64::new(0),
             metrics: Mutex::new(OutputMetrics::default()),
             status: Mutex::new("Iniciando V-Cam local…".into()),
@@ -563,6 +565,7 @@ fn validate_rgb(w: u32, h: u32, len: usize) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn letterbox_bgra(w: u32, h: u32, rgb: Vec<u8>, tw: u32, th: u32) -> Result<Vec<u8>, String> {
     #[cfg(target_os = "macos")]
     {
@@ -605,8 +608,19 @@ fn reference_letterbox_bgra(
     }
     Ok(output)
 }
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn accelerated_letterbox(w: u32, h: u32, rgb: &[u8], tw: u32, th: u32) -> Result<Vec<u8>, String> {
+    accelerated_letterbox_reusing(w, h, rgb, tw, th, &mut Vec::new())
+}
+#[cfg(target_os = "macos")]
+fn accelerated_letterbox_reusing(
+    w: u32,
+    h: u32,
+    rgb: &[u8],
+    tw: u32,
+    th: u32,
+    converted: &mut Vec<u8>,
+) -> Result<Vec<u8>, String> {
     use std::{ffi::c_void, ptr};
     #[repr(C)]
     struct Buffer {
@@ -661,7 +675,7 @@ fn accelerated_letterbox(w: u32, h: u32, rgb: &[u8], tw: u32, th: u32) -> Result
     let code = if (rw, rh) == (w as usize, h as usize) {
         unsafe { vImageConvert_RGB888toBGRA8888(&source, ptr::null(), 255, &target, false, 0) }
     } else {
-        let mut converted = vec![0u8; w as usize * h as usize * 4];
+        converted.resize(w as usize * h as usize * 4, 0);
         let bgra = Buffer {
             data: converted.as_mut_ptr().cast(),
             height: h as usize,
@@ -1340,7 +1354,11 @@ mod native {
             let converter = thread::spawn(move || {
                 let result = video_qos(0x19).and_then(|()| {
                     conversion_loop(conversion_state.clone(), |w, h, rgb| {
-                        letterbox_bgra(w, h, rgb, WIDTH, HEIGHT)
+                        let mut scratch = conversion_state
+                            .conversion_scratch
+                            .lock()
+                            .map_err(|_| "V-Cam: scratch de conversão indisponível")?;
+                        accelerated_letterbox_reusing(w, h, &rgb, WIDTH, HEIGHT, &mut scratch)
                     })
                 });
                 if let Err(error) = &result {
@@ -1377,6 +1395,9 @@ mod native {
                             }
                         }
                         playout = Playout::default();
+                        if let Ok(mut scratch) = state.conversion_scratch.lock() {
+                            *scratch = Vec::new();
+                        }
                         session.send(
                             &placeholder,
                             None,
@@ -1510,6 +1531,23 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn conversion_reuses_large_scratch_without_reusing_old_image_pixels() {
+        let mut scratch = Vec::new();
+        let first =
+            accelerated_letterbox_reusing(8, 8, &[255, 0, 0].repeat(64), 4, 4, &mut scratch)
+                .unwrap();
+        let address = scratch.as_ptr();
+        let capacity = scratch.capacity();
+        let second =
+            accelerated_letterbox_reusing(8, 8, &[0, 0, 255].repeat(64), 4, 4, &mut scratch)
+                .unwrap();
+        assert_eq!(scratch.as_ptr(), address);
+        assert_eq!(scratch.capacity(), capacity);
+        assert!(first.chunks_exact(4).all(|p| p == [0, 0, 255, 255]));
+        assert!(second.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+    }
     #[test]
     fn no_consumer_skips_conversion_but_unknown_usage_keeps_output_available() {
         let sink = VirtualSink {

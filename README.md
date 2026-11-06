@@ -26,7 +26,7 @@ Availability depends on the firmware and video mode. Firmware tracking and gestu
 
 - Apple Silicon Mac; macOS14 or later APIs. Current runtime testing was on macOS27.
 - EMEET PIXY USB device `328f:00c0`. Other EMEET models are not selected automatically.
-- Rust stable, Cargo, and Xcode Command Line Tools.
+- Rust1.97.0 (pinned in `rust-toolchain.toml`), Cargo, and Xcode Command Line Tools.
 - FFmpeg on `PATH` or at `/opt/homebrew/bin/ffmpeg` for recording. Preview and controls do not require FFmpeg.
 - **For virtual output only:** the EMEET STUDIO camera extension must already be installed and approved through the vendor's normal macOS installation flow. Pixy Control does not install or distribute it.
 
