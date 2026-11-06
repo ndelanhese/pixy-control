@@ -19,4 +19,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo build --release --locked
+      - name: Build app and USB launcher
+        run: |
+          zsh -n build-app.sh install-background.sh
+          zsh build-app.sh "$RUNNER_TEMP/Pixy Control.app"
+          codesign --verify --deep --strict "$RUNNER_TEMP/Pixy Control.app"
