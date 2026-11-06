@@ -24,9 +24,9 @@ Availability depends on the firmware and video mode. Firmware tracking and gestu
 
 ## Requirements
 
-- Apple Silicon Mac; macOS14 or later APIs. Current runtime testing was on macOS27.
+- Apple Silicon Mac; macOS 14 or later APIs. Current runtime testing was on macOS 27.
 - EMEET PIXY USB device `328f:00c0`. Other EMEET models are not selected automatically.
-- Rust1.97.0 (pinned in `rust-toolchain.toml`), Cargo, and Xcode Command Line Tools.
+- Rust 1.97.0 (pinned in `rust-toolchain.toml`), Cargo, and Xcode Command Line Tools.
 - FFmpeg on `PATH` or at `/opt/homebrew/bin/ffmpeg` for recording. Preview and controls do not require FFmpeg.
 - **For virtual output only:** the EMEET STUDIO camera extension must already be installed and approved through the vendor's normal macOS installation flow. Pixy Control does not install or distribute it.
 
@@ -53,7 +53,7 @@ Build the `.app` and launch it normally so macOS can show camera and microphone 
 
 Selecting the physical **EMEET PIXY** bypasses the software crop and blur. Hardware controls still go directly to the camera.
 
-The installed extension accepts **1920×1080 at30fps**. Selecting4K in Pixy Control sets its physical capture format, not the format requested by every other application. Call apps may scale or compress the video independently. A30fps transport does not imply30 different frames when blur or other processing produces fewer.
+The installed extension accepts **1920×1080 at 30 fps**. Selecting 4K in Pixy Control sets its physical capture format, not the format requested by every other application. Call apps may scale or compress the video independently. A 30 fps transport does not imply 30 different frames when blur or other processing produces fewer.
 
 ```mermaid
 flowchart LR
@@ -73,9 +73,9 @@ Manual privacy remains locked until you explicitly choose Manual or Tracking. Un
 
 ### Performance
 
-Conversion runs separately from the fixed30Hz output clock. A bounded two-frame reserve absorbs conversion jitter. Pixel buffers and the video format description are reused; repeated/neutral frames reuse immutable pixels. Without consumers, conversion and publication stop; after five confirmed idle seconds, the producer transport is suspended and resumes when usage returns. Connected clients keep the same active session through capture pauses. Background/minimized UI work is reduced.
+Conversion runs separately from the fixed 30 Hz output clock. A bounded two-frame reserve absorbs conversion jitter. Pixel buffers and the video format description are reused; repeated/neutral frames reuse immutable pixels. Without consumers, conversion and publication stop; after five confirmed idle seconds, the producer transport is suspended and resumes when usage returns. Connected clients keep the same active session through capture pauses. Background/minimized UI work is reduced.
 
-4K blur costs more than1080p. For lower resource use, choose1080p and disable blur when unnecessary. Hardware encoding requires VideoToolbox; recording reports an error instead of silently falling back to a slower software encoder.
+4K blur costs more than 1080p. For lower resource use, choose 1080p and disable blur when unnecessary. Hardware encoding requires VideoToolbox; recording reports an error instead of silently falling back to a slower software encoder.
 
 ## Data and privacy
 
