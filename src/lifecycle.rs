@@ -99,6 +99,26 @@ pub fn activate() {
     }
 }
 
+/// Query actual AppKit visibility, rather than repeatedly issuing orderOut.
+/// Reissuing Visible(false) itself wakes winit and can create an idle busy loop.
+pub fn window_visible() -> bool {
+    unsafe {
+        let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let windows: *mut Object = msg_send![app, windows];
+        let count: usize = msg_send![windows, count];
+        for i in 0..count {
+            let window: *mut Object = msg_send![windows, objectAtIndex: i];
+            let title: *mut Object = msg_send![window, title];
+            let main: bool = msg_send![title, isEqualToString: ns("Pixy Control")];
+            let visible: bool = msg_send![window, isVisible];
+            if main && visible {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

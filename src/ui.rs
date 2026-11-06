@@ -759,7 +759,7 @@ impl eframe::App for PixyApp {
         }
         // eframe reveals its native window after the initial paint even if the
         // viewport builder requested hidden. Keep the service's state authoritative.
-        if self.lifecycle.hidden && !self.lifecycle.quitting {
+        if self.lifecycle.hidden && !self.lifecycle.quitting && crate::lifecycle::window_visible() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         if let Some(result) = self
