@@ -2,6 +2,11 @@
 #[cfg(target_os = "macos")]
 #[path = "quad_native.rs"]
 mod native;
+/// Release the shared full-frame scratch after capture has fully stopped.
+pub(crate) fn release_scratch() {
+    #[cfg(target_os = "macos")]
+    native::release_scratch();
+}
 pub type Quad = [[f32; 2]; 4];
 pub const FULL_QUAD: Quad = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
 /// Points must follow TL, TR, BR, BL around a strictly convex region. Image

@@ -63,6 +63,11 @@ static SCRATCH: Mutex<Scratch> = Mutex::new(Scratch {
     destination: Vec::new(),
     temp: Vec::new(),
 });
+pub(crate) fn release_scratch() {
+    if let Ok(mut scratch) = SCRATCH.lock() {
+        *scratch = Scratch::default();
+    }
+}
 fn checked(status: isize, operation: &str) -> Result<(), String> {
     if status < 0 {
         Err(format!("Accelerate {operation}: {status}"))

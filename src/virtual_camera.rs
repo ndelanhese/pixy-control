@@ -655,8 +655,10 @@ fn accelerated_letterbox_reusing(
     let rh = (f64::from(h) * scale).round().max(1.0).min(f64::from(th)) as usize;
     let (left, top) = ((tw as usize - rw) / 2, (th as usize - rh) / 2);
     let mut output = vec![0u8; tw as usize * th as usize * 4];
-    for pixel in output.chunks_exact_mut(4) {
-        pixel[3] = 255;
+    if (rw, rh) != (tw as usize, th as usize) {
+        for pixel in output.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
     }
     let source = Buffer {
         data: rgb.as_ptr() as *mut c_void,
@@ -673,7 +675,7 @@ fn accelerated_letterbox_reusing(
         row_bytes: tw as usize * 4,
     };
     let code = if (rw, rh) == (w as usize, h as usize) {
-        unsafe { vImageConvert_RGB888toBGRA8888(&source, ptr::null(), 255, &target, false, 0) }
+        unsafe { vImageConvert_RGB888toBGRA8888(&source, ptr::null(), 255, &target, false, 16) }
     } else {
         converted.resize(w as usize * h as usize * 4, 0);
         let bgra = Buffer {
@@ -683,15 +685,16 @@ fn accelerated_letterbox_reusing(
             row_bytes: w as usize * 4,
         };
         let conversion_code =
-            unsafe { vImageConvert_RGB888toBGRA8888(&source, ptr::null(), 255, &bgra, false, 0) };
+            unsafe { vImageConvert_RGB888toBGRA8888(&source, ptr::null(), 255, &bgra, false, 16) };
         if conversion_code != 0 {
             return Err(format!(
                 "V-Cam: conversão de cor Accelerate ({conversion_code})"
             ));
         }
         // SDK Geometry.h explicitly supports BGRA ordering with this4-channel
-        // scaler. flags0 uses native default resampling with edge extension.
-        unsafe { vImageScale_ARGB8888(&bgra, &target, ptr::null_mut(), 0) }
+        // scaler. kvImageDoNotTile(16) keeps this bounded video worker serial,
+        // avoiding internal worker scheduling spikes; resampling is unchanged.
+        unsafe { vImageScale_ARGB8888(&bgra, &target, ptr::null_mut(), 16) }
     };
     if code != 0 {
         return Err(format!("V-Cam: redimensionamento Accelerate ({code})"));

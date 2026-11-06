@@ -182,6 +182,7 @@ impl Preview {
                 Ok(()) => worker.status("Prévia encerrada"),
                 Err(error) => worker.status(format!("Prévia: {error}")),
             }
+            crate::quad::release_scratch();
             worker.finished.store(true, Ordering::Release);
         });
         Self { shared }
