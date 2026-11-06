@@ -8,4 +8,6 @@ destination="${1:-$repo/../Pixy Control.app}"
 mkdir -p "$destination/Contents/MacOS" "$destination/Contents/Resources"
 cp assets/Info.plist "$destination/Contents/Info.plist"
 cp "$cargo_target_dir/release/pixy-control" "$destination/Contents/MacOS/Pixy Control"
+xcrun swiftc -O assets/DeviceLauncher.swift -o "$destination/Contents/MacOS/Pixy Device Launcher" -framework IOKit -framework AppKit
+codesign --force --sign - "$destination/Contents/MacOS/Pixy Device Launcher"
 codesign --force --sign - "$destination"

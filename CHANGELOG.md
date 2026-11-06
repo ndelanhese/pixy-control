@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Keep virtual output, local blur and automatic privacy active after closing the window; reopen or quit from the macOS menu bar.
+- Add an event-driven USB launcher and per-user login installation, with removal script.
+- Skip hidden-window layout and texture work.
+
+## Unreleased
+
 - Initial public source for the native Rust PIXY controller.
 - Local camera controls, framing, presets, photos, and segmented hardware video recording.
 - Local person-segmented background blur.

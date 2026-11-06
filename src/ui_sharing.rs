@@ -128,7 +128,7 @@ impl PixyApp {
             })
             .unwrap_or((Usage::Unknown, None));
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
-        let local_preview = focused && self.preview_visible;
+        let local_preview = !self.lifecycle.hidden && focused && self.preview_visible;
         let usage = crate::sharing_usage::aggregate(
             physical,
             if self.virtual_enabled {

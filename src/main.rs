@@ -7,6 +7,7 @@ mod exposure;
 mod fluency_check;
 mod hardware_check;
 mod hid;
+mod lifecycle;
 mod meter;
 mod model;
 mod preview;
@@ -120,6 +121,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_visible(!args.iter().any(|a| a == "--background"))
+            .with_active(!args.iter().any(|a| a == "--background"))
             .with_inner_size([1440.0, 760.0])
             .with_min_inner_size([1100.0, 680.0]),
         vsync: true,
@@ -128,7 +131,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "Pixy Control",
         options,
-        Box::new(|cc| Ok(Box::new(ui::PixyApp::new(cc)))),
+        Box::new(|cc| {
+            lifecycle::install_menu(&cc.egui_ctx);
+            Ok(Box::new(ui::PixyApp::new(cc)))
+        }),
     )?;
     Ok(())
 }

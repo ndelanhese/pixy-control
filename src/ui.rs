@@ -75,6 +75,7 @@ pub struct PixyApp {
     step: i64,
     view: FrameTransform,
     preview_visible: bool,
+    lifecycle: crate::lifecycle::Lifecycle,
     output_folder: String,
     segment_seconds: u32,
     recorder: Option<Recorder>,
@@ -181,6 +182,10 @@ impl PixyApp {
             step: 5,
             view: settings.view,
             preview_visible: true,
+            lifecycle: crate::lifecycle::Lifecycle {
+                hidden: std::env::args().any(|a| a == "--background"),
+                ..Default::default()
+            },
             output_folder: settings.folder,
             segment_seconds: settings.segment,
             recorder: None,
@@ -734,6 +739,29 @@ impl PixyApp {
 
 impl eframe::App for PixyApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        match crate::lifecycle::take_action() {
+            1 => {
+                self.lifecycle.reopen();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                crate::lifecycle::activate();
+            }
+            2 => {
+                self.lifecycle.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            _ => {}
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.lifecycle.close_requested() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        // eframe reveals its native window after the initial paint even if the
+        // viewport builder requested hidden. Keep the service's state authoritative.
+        if self.lifecycle.hidden && !self.lifecycle.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
         if let Some(result) = self
             .virtual_start
             .as_ref()
@@ -794,10 +822,13 @@ impl eframe::App for PixyApp {
                 }
             }
         }
-        if (self.output_page == 1 || self.page == 2) && self.meter.is_none() {
+        if !self.lifecycle.hidden
+            && (self.output_page == 1 || self.page == 2)
+            && self.meter.is_none()
+        {
             self.meter = Some(crate::meter::Meter::start());
         }
-        if self.output_page != 1 && self.page != 2 {
+        if self.lifecycle.hidden || (self.output_page != 1 && self.page != 2) {
             self.meter = None;
         }
         if self.preview.as_ref().is_some_and(Preview::is_finished) {
@@ -857,7 +888,8 @@ impl eframe::App for PixyApp {
                 },
                 ..self.view
             };
-            let display_active = self.preview_visible
+            let display_active = !self.lifecycle.hidden
+                && self.preview_visible
                 && ctx.input(|i| i.viewport().focused.unwrap_or(false))
                 && !ctx.input(|i| i.viewport().minimized.unwrap_or(false));
             let prepared = preview.latest_prepared(display_view);
@@ -931,6 +963,13 @@ impl eframe::App for PixyApp {
             if let Some(mut r) = self.recorder.take() {
                 self.notice = r.stop().map(|_| r.status()).unwrap_or_else(|e| e);
             }
+        }
+        if self.lifecycle.hidden {
+            self.texture = None;
+            self.overview_texture = None;
+            self.persist_settings();
+            self.write_sharing_report();
+            return;
         }
         self.studio_layout(ctx);
         self.persist_settings();

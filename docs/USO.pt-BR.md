@@ -102,3 +102,11 @@ A câmera virtual converte a imagem em um worker separado e publica no relógio 
 A saída reutiliza pixel buffers nativos e a descrição de formato. Quadros repetidos e a imagem neutra reutilizam os mesmos pixels imutáveis; os buffers livres são liberados ao entrar em pausa. A prévia deixa de subir texturas para a GPU quando minimizada ou oculta, e reduz as atualizações da interface nesse estado. A câmera virtual continua recebendo imagens processadas no callback nativo.
 
 Sem consumidores, a saída deixa de converter/enviar quadros. Após cinco segundos sem clientes confirmados, suspende o transporte produtor; um novo consumidor solicita a retomada. Durante uso ativo ou desconhecido, a sessão continua conectada, inclusive para a imagem neutra durante pausas.
+
+## Janela fechada e início com a câmera
+
+Fechar pelo botão vermelho mantém câmera virtual, blur, gravação e privacidade automática em segundo plano. A prévia fechada não conta como uso: sem outro aplicativo usando a câmera e sem gravação, a privacidade automática continua atuando. Reabra por **Pixy → Abrir Pixy Control** na barra de menus. Para parar de verdade, use **Encerrar Pixy Control**.
+
+Após compilar, instale com `zsh install-background.sh "caminho/Pixy Control.app"`. O app fica em `~/Applications`; um LaunchAgent do usuário observa eventos USB e abre o app sem janela ao conectar a PIXY, ou ao entrar no macOS com ela conectada. Não há polling USB nem captura no observador. O macOS pode exigir que o item de segundo plano permaneça permitido em Itens de Início.
+
+Para desativar: `zsh install-background.sh --uninstall`. Um encerramento explícito não é desfeito até nova conexão ou login. A inicialização não modifica a posição/modo de startup gravados no firmware da câmera.

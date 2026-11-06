@@ -69,7 +69,21 @@ flowchart LR
 
 Enable **V-Cam → Privacidade automática**. A visible foreground preview and recording count as use. After confirmed idle, the app enters firmware Privacy and remembers Manual/Tracking. A later consumer wakes the camera and restores that mode. Brief client renegotiations have a hold period before USB capture is released.
 
-Manual privacy remains locked until you explicitly choose Manual or Tracking. Unknown usage is never treated as confirmed idle. Automatic privacy requires Pixy Control to remain running; this is not an OS-wide guarantee after quitting or crashing. Closing the main window exits the application.
+Manual privacy remains locked until you explicitly choose Manual or Tracking. Unknown usage is never treated as confirmed idle. Automatic privacy requires Pixy Control to remain running; this is not an OS-wide guarantee after quitting or crashing. Closing the main window keeps the service running. Use **Pixy** in the macOS menu bar to reopen the window or explicitly quit.
+
+### Background and USB startup
+
+The red close button hides the window while virtual output, local blur, recording and automatic privacy continue. The menu bar **Pixy → Abrir Pixy Control** restores it; **Encerrar Pixy Control** stops the service.
+
+To install the app in `~/Applications` and enable automatic startup:
+
+```sh
+zsh install-background.sh "$PWD/dist/Pixy Control.app"
+```
+
+A per-user LaunchAgent starts a small IOKit observer at login. It launches Pixy Control hidden when USB device `328f:00c0` appears, including if already connected at login. It sleeps awaiting USB events; it does not poll or capture video. Quitting remains effective until the next connection/login; it does not repeatedly relaunch the main app. Login Items must remain allowed by macOS.
+
+Disable automatic startup with `zsh install-background.sh --uninstall`. This removes only this project's LaunchAgent and leaves settings and the application intact. The observer runs only in the logged-in user's session.
 
 ### Performance
 
