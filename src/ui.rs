@@ -627,7 +627,7 @@ impl PixyApp {
         };
     }
     fn capture(&mut self) {
-        if !self.frame_ready() {
+        if !self.full_frame_ready() {
             self.notice = "Aguardando um quadro no enquadramento escolhido…".into();
             return;
         }
@@ -655,7 +655,7 @@ impl PixyApp {
             recorder.request_stop();
             return;
         }
-        if !self.frame_ready() {
+        if !self.full_frame_ready() {
             self.notice = "Aguardando um quadro no enquadramento escolhido…".into();
             return;
         }
@@ -686,6 +686,19 @@ impl PixyApp {
             }
             Err(e) => self.notice = e,
         }
+    }
+    fn full_frame_ready(&self) -> bool {
+        let (w, h, _) = model::FORMATS[self.format];
+        let expected = if self.view.aspect == Aspect::Portrait {
+            (h, w)
+        } else {
+            (w, h)
+        };
+        self.frame_ready()
+            && self
+                .frame
+                .as_ref()
+                .is_some_and(|(w, h, _)| (*w, *h) == expected)
     }
     fn frame_ready(&self) -> bool {
         !self.privacy_blocked
@@ -780,6 +793,11 @@ impl eframe::App for PixyApp {
                 }
             }
         }
+        self.controller.set_background(
+            self.lifecycle.hidden
+                || ctx.input(|i| i.viewport().minimized.unwrap_or(false))
+                || !ctx.input(|i| i.viewport().focused.unwrap_or(false)),
+        );
         if let Some(s) = self.controller.latest() {
             if !s.message.is_empty() {
                 self.notice = s.message.clone();
@@ -892,6 +910,7 @@ impl eframe::App for PixyApp {
                 && self.preview_visible
                 && ctx.input(|i| i.viewport().focused.unwrap_or(false))
                 && !ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+            preview.set_live_only(!display_active);
             let prepared = preview.latest_prepared(display_view);
             if !display_active {
                 self.texture = None;

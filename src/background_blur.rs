@@ -23,6 +23,33 @@ pub struct Benchmark {
     pub p90_ms: f64,
     pub last: Stats,
 }
+pub struct PersonMask {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+#[cfg(target_os = "macos")]
+pub struct Segmenter {
+    native: native::Segmenter,
+}
+// Vision and CV buffers move by exclusive ownership; no concurrent access or UI affinity.
+#[cfg(target_os = "macos")]
+unsafe impl Send for Segmenter {}
+#[cfg(target_os = "macos")]
+impl Segmenter {
+    pub fn new() -> Result<Self, String> {
+        Ok(Self {
+            native: native::Segmenter::new()?,
+        })
+    }
+    pub fn reset(&mut self) -> Result<(), String> {
+        self.native.reset()
+    }
+    pub fn generate(&mut self, w: u32, h: u32, rgb: &[u8]) -> Result<PersonMask, String> {
+        validate(w, h, rgb.len(), 1.0)?;
+        self.native.generate(w, h, rgb)
+    }
+}
 pub struct Processor {
     #[cfg(target_os = "macos")]
     native: native::Native,
@@ -408,6 +435,117 @@ mod native {
     }
     unsafe fn dictionary(keys: &[*mut Object], values: &[*mut Object]) -> *mut Object {
         msg_send![class!(NSDictionary),dictionaryWithObjects:values.as_ptr() forKeys:keys.as_ptr() count:keys.len()]
+    }
+    pub(super) struct Segmenter {
+        request: Owned,
+        sequence: Owned,
+        requests: Owned,
+        input: Option<(u32, u32, Pixel)>,
+    }
+    impl Segmenter {
+        pub(super) fn new() -> Result<Self, String> {
+            unsafe {
+                let _pool = Pool::new();
+                let (r, s, a) = Native::sequence()?;
+                Ok(Self {
+                    request: r,
+                    sequence: s,
+                    requests: a,
+                    input: None,
+                })
+            }
+        }
+        pub(super) fn reset(&mut self) -> Result<(), String> {
+            unsafe {
+                let _pool = Pool::new();
+                let (r, s, a) = Native::sequence()?;
+                self.request = r;
+                self.sequence = s;
+                self.requests = a;
+                Ok(())
+            }
+        }
+        pub(super) fn generate(
+            &mut self,
+            w: u32,
+            h: u32,
+            rgb: &[u8],
+        ) -> Result<super::PersonMask, String> {
+            unsafe {
+                let _pool = Pool::new();
+                if w > 512 || h > 512 {
+                    return Err("Entrada de segmentação grande demais".into());
+                }
+                if self
+                    .input
+                    .as_ref()
+                    .is_none_or(|(iw, ih, _)| (*iw, *ih) != (w, h))
+                {
+                    self.input = Some((w, h, Pixel::new(w as usize, h as usize, BGRA)?));
+                }
+                let input = &self
+                    .input
+                    .as_ref()
+                    .ok_or("Buffer de segmentação indisponível")?
+                    .2;
+                {
+                    let lock = Locked::new(input.0)?;
+                    let source = Buffer {
+                        data: rgb.as_ptr() as *mut c_void,
+                        width: w as usize,
+                        height: h as usize,
+                        row_bytes: w as usize * 3,
+                    };
+                    check(
+                        vImageConvert_RGB888toBGRA8888(
+                            &source,
+                            ptr::null(),
+                            255,
+                            &lock.view(),
+                            false,
+                            16,
+                        ),
+                        "entrada da máscara",
+                    )?;
+                }
+                let mut error: *mut Object = ptr::null_mut();
+                let ok: BOOL = msg_send![self.sequence.0,performRequests:self.requests.0 onCVPixelBuffer:input.0 orientation:1u32 error:&mut error];
+                if ok != YES {
+                    return Err(format!("Vision não segmentou a pessoa: {}", text(error)));
+                }
+                let results: *mut Object = msg_send![self.request.0, results];
+                let count: usize = msg_send![results, count];
+                if count != 1 {
+                    return Err("Vision não gerou uma máscara".into());
+                }
+                let result: *mut Object = msg_send![results,objectAtIndex:0usize];
+                let mask: *mut c_void = msg_send![result, pixelBuffer];
+                if mask.is_null() || CVPixelBufferGetPixelFormatType(mask) != MASK {
+                    return Err("Máscara inválida".into());
+                }
+                let (mw, mh) = (CVPixelBufferGetWidth(mask), CVPixelBufferGetHeight(mask));
+                if mw == 0 || mh == 0 || mw > 4096 || mh > 4096 {
+                    return Err("Dimensões de máscara inválidas".into());
+                }
+                let lock = Locked::new(mask)?;
+                let b = lock.view();
+                if b.row_bytes < mw {
+                    return Err("Stride da máscara inválido".into());
+                }
+                let mut pixels = vec![0; mw * mh];
+                for y in 0..mh {
+                    pixels[y * mw..(y + 1) * mw].copy_from_slice(std::slice::from_raw_parts(
+                        (b.data as *const u8).add(y * b.row_bytes),
+                        mw,
+                    ));
+                }
+                Ok(super::PersonMask {
+                    width: mw as u32,
+                    height: mh as u32,
+                    pixels,
+                })
+            }
+        }
     }
     struct Frames {
         input: Pixel,

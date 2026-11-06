@@ -35,6 +35,19 @@ impl Default for FrameTransform {
         }
     }
 }
+/// Render the same normalized framing within a bounded live-output canvas.
+pub fn apply_bounded(
+    width: u32,
+    height: u32,
+    rgb: Vec<u8>,
+    view: &FrameTransform,
+    limit: u32,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    if limit < 2 {
+        return Err("Limite de saída inválido".into());
+    }
+    apply_inner(width, height, rgb, view, Some(limit))
+}
 /// Native source flips precede rotation, so their display axes swap at90/270°.
 pub fn effective_flips(view: &FrameTransform) -> (bool, bool) {
     if view.rotation % 2 == 1 {
@@ -52,6 +65,15 @@ pub fn apply(
     height: u32,
     rgb: Vec<u8>,
     transform: &FrameTransform,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    apply_inner(width, height, rgb, transform, None)
+}
+fn apply_inner(
+    width: u32,
+    height: u32,
+    rgb: Vec<u8>,
+    transform: &FrameTransform,
+    limit: Option<u32>,
 ) -> Result<(u32, u32, Vec<u8>), String> {
     let expected = (width as usize)
         .checked_mul(height as usize)
@@ -72,7 +94,8 @@ pub fn apply(
         return Err("Transformação de imagem inválida".into());
     }
     // Preserve allocation on the common unmodified preview path.
-    if transform.rotation == 0
+    if limit.is_none_or(|limit| width.max(height) <= limit)
+        && transform.rotation == 0
         && transform.aspect == Aspect::Original
         && transform.zoom == 1.0
         && !transform.mirror
@@ -81,6 +104,30 @@ pub fn apply(
         && height.is_multiple_of(2)
     {
         return apply_quad(width, height, rgb, transform, width, height);
+    }
+    let (ow, oh, matrix) = render_plan(width, height, transform, limit)?;
+    crate::quad::warp_rgb_mapped(width, height, rgb, ow, oh, matrix)
+}
+/// Geometry is evaluated in the original capture canvas, then sampled directly
+/// into the live canvas. Zoom never discards 4K detail before the crop.
+pub(crate) fn render_plan(
+    width: u32,
+    height: u32,
+    transform: &FrameTransform,
+    limit: Option<u32>,
+) -> Result<(u32, u32, [f64; 8]), String> {
+    if width < 2
+        || height < 2
+        || limit.is_some_and(|n| n < 2)
+        || transform.rotation > 3
+        || !transform.zoom.is_finite()
+        || !(1.0..=4.0).contains(&transform.zoom)
+        || !transform.x.is_finite()
+        || !(0.0..=1.0).contains(&transform.x)
+        || !transform.y.is_finite()
+        || !(0.0..=1.0).contains(&transform.y)
+    {
+        return Err("Transformação inválida".into());
     }
     let (canvas_width, canvas_height) = match transform.aspect {
         Aspect::Portrait => (height & !1, width & !1),
@@ -131,7 +178,17 @@ pub fn apply(
     }
     matrix[6] = h[6];
     matrix[7] = h[7];
-    crate::quad::warp_rgb_mapped(width, height, rgb, canvas_width, canvas_height, matrix)
+    let (ow, oh) =
+        if let Some(limit) = limit.filter(|limit| canvas_width.max(canvas_height) > *limit) {
+            let scale = f64::from(limit) / f64::from(canvas_width.max(canvas_height));
+            (
+                ((f64::from(canvas_width) * scale).round() as u32 & !1).max(2),
+                ((f64::from(canvas_height) * scale).round() as u32 & !1).max(2),
+            )
+        } else {
+            (canvas_width, canvas_height)
+        };
+    Ok((ow, oh, matrix))
 }
 /// Map canvas pixel endpoints into the selected source pixel endpoints. A small
 /// fitted source is centered with bars; an enlarged source pans within its crop.
@@ -633,5 +690,42 @@ mod blur_settings_tests {
         value["background_blur"] = serde_json::json!(2.0);
         let view: super::FrameTransform = serde_json::from_value(value).unwrap();
         assert!(super::apply(2, 2, vec![0; 12], &view).is_err());
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    #[test]
+    fn live_canvas_is_bounded_without_losing_pan_zoom_or_aspect() {
+        let mut rgb = vec![0; 16 * 8 * 3];
+        for y in 0..8 {
+            for x in 0..16 {
+                let i = (y * 16 + x) * 3;
+                rgb[i..i + 3].copy_from_slice(&[(x * 10) as u8, (y * 20) as u8, 100]);
+            }
+        }
+        let view = FrameTransform {
+            zoom: 2.0,
+            x: 1.0,
+            y: 0.0,
+            ..Default::default()
+        };
+        let (w, h, out) = apply_bounded(16, 8, rgb, &view, 8).unwrap();
+        assert_eq!((w, h), (8, 4));
+        assert_eq!(&out[..3], &[80, 0, 100]);
+        assert_eq!(&out[out.len() - 3..], &[150, 60, 100]);
+    }
+    #[test]
+    fn bounded_portrait_and_small_inputs_keep_shape_and_never_upscale() {
+        let view = FrameTransform {
+            aspect: Aspect::Portrait,
+            rotation: 1,
+            ..Default::default()
+        };
+        let (w, h, _) = apply_bounded(16, 8, vec![100; 16 * 8 * 3], &view, 8).unwrap();
+        assert_eq!((w, h), (4, 8));
+        let (w, h, _) = apply_bounded(4, 2, vec![100; 24], &FrameTransform::default(), 8).unwrap();
+        assert_eq!((w, h), (4, 2));
     }
 }

@@ -194,6 +194,97 @@ fn consume(path: &Path, kind: &str, mut preview: Preview) -> Result<(), String> 
         Err(error.unwrap_or_else(|| shutdown_error.unwrap_or("Consumidor falhou").into()))
     }
 }
+/// Real camera pixels, in a second process, measured without image encoding or
+/// UI screenshots inside the timed interval. Repeated transport samples do not
+/// count as new images. No raw frame is written to disk.
+pub fn measure_virtual(path: &Path) -> Result<(), String> {
+    use std::hash::{Hash, Hasher};
+    crate::video_activity::prioritize_current_thread()?;
+    let mut preview = Preview::start_virtual(1920, 1080, 30);
+    let result = (|| -> Result<Value, String> {
+        let deadline = Instant::now() + Duration::from_secs(35);
+        while preview.latest_timed().is_none() {
+            if preview.is_finished() || Instant::now() > deadline {
+                return Err(preview.status());
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        thread::sleep(Duration::from_secs(6));
+        preview.latest_timed();
+        let start = Instant::now();
+        let mut frames = Vec::new();
+        let mut previous = None;
+        while start.elapsed() < Duration::from_secs(60) {
+            if preview.is_finished() {
+                return Err(preview.status());
+            }
+            if let Some(frame) = preview.latest_timed() {
+                let (w, h, rgb) = frame.image;
+                if w < 2
+                    || h < 2
+                    || w > 3840
+                    || h > 2160
+                    || rgb.len() != w as usize * h as usize * 3
+                {
+                    return Err(format!("Unexpected dimensions {w}x{h}"));
+                }
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                rgb.hash(&mut hash);
+                let digest = hash.finish();
+                let source_id = crate::fluency_check::decode(&rgb, w, h);
+                let changed = previous != Some(digest);
+                previous = Some(digest);
+                frames.push(json!({"received_ms":frame.received_at.saturating_duration_since(start).as_secs_f64()*1000.0,"sequence":frame.sequence,"pts_ns":frame.pts_ns,"pixels_changed":changed,"fingerprint":digest,"width":w,"height":h,"source_id":source_id}));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let unique: Vec<_> = frames
+            .iter()
+            .filter(|f| f["pixels_changed"] == true)
+            .collect();
+        let mut gaps: Vec<_> = unique
+            .windows(2)
+            .map(|f| f[1]["received_ms"].as_f64().unwrap() - f[0]["received_ms"].as_f64().unwrap())
+            .collect();
+        gaps.sort_by(f64::total_cmp);
+        let p95 = gaps
+            .get((gaps.len() as f64 * 0.95) as usize)
+            .copied()
+            .unwrap_or(f64::INFINITY);
+        let max = gaps.last().copied().unwrap_or(f64::INFINITY);
+        let fps = unique.len() as f64 / elapsed;
+        let marker_frames = frames
+            .iter()
+            .filter(|f| f["source_id"].as_u64().is_some())
+            .count();
+        let marker_ids: std::collections::HashSet<_> = frames
+            .iter()
+            .filter_map(|f| f["source_id"].as_u64())
+            .collect();
+        let passed = fps >= 28.5 && p95 <= 50.0 && max <= 100.0;
+        Ok(
+            json!({"test":"real_virtual_pixel_fluency","marker_frames":marker_frames,"unique_marker_frames":marker_ids.len(),"marker_fps":marker_ids.len() as f64 / elapsed,"passed":passed,"seconds":elapsed,"unique_fps":fps,"unique_frames":unique.len(),"samples":frames.len(),"gap_p95_ms":p95,"gap_max_ms":max,"thresholds":{"minimum_unique_fps":28.5,"p95_gap_ms":50,"worst_gap_ms":100},"frames":frames,"scope":"Atomic sample timing and full RGB fingerprints; optional CRC-verified source marker identifies frames when the producer uses --trace-camera-frames. Identical pixels alone cannot distinguish a static image from a repeated capture; no source latency is inferred."}),
+        )
+    })();
+    preview.stop();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !preview.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut report = result.unwrap_or_else(|e| json!({"passed":false,"error":e}));
+    report["consumer_stopped"] = json!(preview.is_finished());
+    if !preview.is_finished() {
+        report["passed"] = json!(false);
+    }
+    crate::model::save_json(path, &report)?;
+    if report["passed"] == true {
+        Ok(())
+    } else {
+        Err("Real virtual-camera motion failed its cadence limits".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

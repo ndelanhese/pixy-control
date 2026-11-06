@@ -34,14 +34,12 @@ fn checksum(id: u32) -> u16 {
 fn marker_word(id: u32) -> u64 {
     (u64::from(MAGIC) << 48) | (u64::from(id) << 16) | u64::from(checksum(id))
 }
-fn stamp(rgb: &mut [u8], w: u32, h: u32, id: u32) -> Result<(), String> {
+pub(crate) fn stamp(rgb: &mut [u8], w: u32, h: u32, id: u32) -> Result<(), String> {
     if w < 120 || h < 120 || rgb.len() != w as usize * h as usize * 3 {
         return Err("Buffer de marcador inválido".into());
     }
-    let cell = w / 120;
-    let origin = cell * 2;
     let word = marker_word(id);
-    if origin + cell * 8 > h {
+    if w * 10 / 120 > h {
         return Err("Altura insuficiente para marcador".into());
     }
     for bit in 0..64u32 {
@@ -50,10 +48,12 @@ fn stamp(rgb: &mut [u8], w: u32, h: u32, id: u32) -> Result<(), String> {
         } else {
             16
         };
-        let left = origin + (bit % 8) * cell;
-        let top = origin + (bit / 8) * cell;
-        for y in top..top + cell {
-            for x in left..left + cell {
+        let left = w * (2 + bit % 8) / 120;
+        let right = w * (3 + bit % 8) / 120;
+        let top = w * (2 + bit / 8) / 120;
+        let bottom = w * (3 + bit / 8) / 120;
+        for y in top..bottom {
+            for x in left..right {
                 let at = (y as usize * w as usize + x as usize) * 3;
                 rgb[at..at + 3].fill(value);
             }
@@ -61,19 +61,17 @@ fn stamp(rgb: &mut [u8], w: u32, h: u32, id: u32) -> Result<(), String> {
     }
     Ok(())
 }
-fn decode(rgb: &[u8], w: u32, h: u32) -> Option<u32> {
+pub(crate) fn decode(rgb: &[u8], w: u32, h: u32) -> Option<u32> {
     if w < 120 || h < 120 || rgb.len() != w as usize * h as usize * 3 {
         return None;
     }
-    let cell = w / 120;
-    let origin = cell * 2;
-    if origin + cell * 8 > h {
+    if w * 10 / 120 > h {
         return None;
     }
     let mut word = 0u64;
     for bit in 0..64u32 {
-        let x = origin + (bit % 8) * cell + cell / 2;
-        let y = origin + (bit / 8) * cell + cell / 2;
+        let x = w * (5 + (bit % 8) * 2) / 240;
+        let y = w * (5 + (bit / 8) * 2) / 240;
         let at = (y as usize * w as usize + x as usize) * 3;
         let luma = (u32::from(rgb[at]) + u32::from(rgb[at + 1]) + u32::from(rgb[at + 2])) / 3;
         let value = if luma >= 180 {
@@ -453,6 +451,25 @@ fn case(w: u32, h: u32, fps: u32) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn camera_marker_survives_negotiated_720p_and_360p_video() {
+        let mut rgb = vec![80; 1920 * 1080 * 3];
+        stamp(&mut rgb, 1920, 1080, 0x5aa5_f00f).unwrap();
+        let image = image::RgbImage::from_raw(1920, 1080, rgb).unwrap();
+        for (w, h) in [(1280, 720), (640, 360)] {
+            let resized =
+                image::imageops::resize(&image, w, h, image::imageops::FilterType::Triangle);
+            assert_eq!(decode(resized.as_raw(), w, h), Some(0x5aa5_f00f));
+        }
+    }
+    #[test]
+    fn camera_marker_roundtrips_non_integral_cell_sizes() {
+        for (w, h) in [(1280, 720), (640, 360), (1920, 1080), (3840, 2160)] {
+            let mut rgb = vec![80; w as usize * h as usize * 3];
+            stamp(&mut rgb, w, h, 0x1234_abcd).unwrap();
+            assert_eq!(decode(&rgb, w, h), Some(0x1234_abcd));
+        }
+    }
     #[test]
     fn marker_roundtrips_extreme_ids_and_detects_corruption() {
         for id in [0, 1, 900, u32::MAX] {

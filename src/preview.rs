@@ -81,6 +81,12 @@ struct Shared {
     >,
     virtual_error: Mutex<Option<String>>,
     blur_processor: Mutex<Option<crate::background_blur::Processor>>,
+    trace_frames: bool,
+    virtual_target: AtomicBool,
+    live_only: AtomicBool,
+    #[cfg(target_os = "macos")]
+    live_processor: Mutex<Option<crate::live_blur::Processor>>,
+    processing: Mutex<std::collections::VecDeque<ProcessingSample>>,
 }
 impl Shared {
     fn new(width: u32, height: u32) -> Self {
@@ -105,6 +111,12 @@ impl Shared {
             virtual_sink: Mutex::new(None),
             virtual_error: Mutex::new(None),
             blur_processor: Mutex::new(None),
+            trace_frames: std::env::args().any(|a| a == "--trace-camera-frames"),
+            virtual_target: AtomicBool::new(false),
+            live_only: AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            live_processor: Mutex::new(None),
+            processing: Mutex::new(std::collections::VecDeque::new()),
         }
     }
     fn note(&self, text: String) {
@@ -121,10 +133,32 @@ impl Shared {
     }
 }
 
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct ProcessingSample {
+    pub sequence: u64,
+    pub source_fingerprint: Option<u64>,
+    pub received_ns: i64,
+    pub total_ms: f64,
+    pub bounded: bool,
+    #[cfg(target_os = "macos")]
+    pub live: Option<crate::live_blur::Stats>,
+    pub blur: Option<crate::background_blur::Stats>,
+}
 pub struct Preview {
     shared: Arc<Shared>,
 }
 impl Preview {
+    /// Only the live 1080p output is needed while no local window is displayed.
+    pub fn set_live_only(&self, value: bool) {
+        self.shared.live_only.store(value, Ordering::Release);
+    }
+    pub fn processing_samples(&self) -> Vec<ProcessingSample> {
+        self.shared
+            .processing
+            .lock()
+            .map(|samples| samples.iter().copied().collect())
+            .unwrap_or_default()
+    }
     pub fn frame_fresh(&self, max_age: std::time::Duration) -> bool {
         !self.shared.cancelled.load(Ordering::Acquire)
             && !self.shared.finished.load(Ordering::Acquire)
@@ -172,6 +206,9 @@ impl Preview {
     }
     fn start_target(width: u32, height: u32, fps: u32, target: Target) -> Self {
         let shared = Arc::new(Shared::new(width, height));
+        shared
+            .virtual_target
+            .store(matches!(target, Target::EmeetVirtual), Ordering::Release);
         let worker = shared.clone();
         thread::spawn(move || {
             #[cfg(target_os = "macos")]
@@ -477,6 +514,7 @@ mod native {
     fn authorize(shared: &Shared) -> Result<(), String> {
         unsafe {
             let status: isize = msg_send![class!(AVCaptureDevice), authorizationStatusForMediaType:AVMediaTypeVideo];
+            shared.status(format!("Permissão da câmera: {status}"));
             match status {
                 3 => return Ok(()),
                 1 | 2 => return Err("Permissão da câmera negada. Autorize Pixy Control em Ajustes do Sistema → Privacidade e Segurança → Câmera.".into()),
@@ -598,6 +636,49 @@ mod native {
     }
 
     type Processed = (crate::transform::FrameTransform, Result<Frame, String>);
+    #[allow(clippy::too_many_arguments)]
+    fn cached_live_transform(
+        cache: &mut Vec<Processed>,
+        processor: &Mutex<Option<crate::background_blur::Processor>>,
+        width: u32,
+        height: u32,
+        rgb: &[u8],
+        view: crate::transform::FrameTransform,
+        limit: Option<u32>,
+    ) -> usize {
+        // Upright rectangular live views can crop/sample directly from the 4K
+        // source into their final canvas, then segment/blur only those pixels.
+        // Full-resolution recording and rotated/flipped/perspective views retain
+        // the original pre-transform segmentation path.
+        let Some(limit) = limit.filter(|_| view.rotation == 0 && !view.flip && view.quad.is_none())
+        else {
+            return cached_transform(cache, processor, width, height, rgb, view);
+        };
+        if let Some(index) = cache.iter().position(|(key, _)| *key == view) {
+            return index;
+        }
+        let frame = (|| -> Result<Frame, String> {
+            let (w, h, mut pixels) =
+                crate::transform::apply_bounded(width, height, rgb.to_vec(), &view, limit)?;
+            if view.background_blur != 0.0 {
+                let mut slot = processor
+                    .lock()
+                    .map_err(|_| "Falha no processador de desfoque")?;
+                if slot.is_none() {
+                    *slot = Some(crate::background_blur::Processor::new()?);
+                }
+                pixels = slot.as_mut().ok_or("Desfoque indisponível")?.apply(
+                    w,
+                    h,
+                    pixels,
+                    view.background_blur,
+                )?;
+            }
+            Ok((w, h, pixels))
+        })();
+        cache.push((view, frame));
+        cache.len() - 1
+    }
     fn cached_transform(
         cache: &mut Vec<Processed>,
         processor: &Mutex<Option<crate::background_blur::Processor>>,
@@ -688,7 +769,9 @@ mod native {
                     ));
                 }
             }
-            if (width as u32, height as u32) != state.expected {
+            if (width as u32, height as u32) != state.expected
+                && !state.virtual_target.load(Ordering::Acquire)
+            {
                 let mismatched = state.mismatched.fetch_add(1, Ordering::Relaxed) + 1;
                 if mismatched >= 30 {
                     if let Ok(mut failure) = state.failure.lock() {
@@ -710,51 +793,108 @@ mod native {
             {
                 return;
             }
-            let mut rgb = vec![0; width * height * 3];
-            for row in 0..height {
-                let source = std::slice::from_raw_parts(base.add(row * stride), width * 4);
-                let target = &mut rgb[row * width * 3..(row + 1) * width * 3];
-                for (source, target) in source.chunks_exact(4).zip(target.chunks_exact_mut(3)) {
-                    target.copy_from_slice(&[source[2], source[1], source[0]]);
+            let requested = state.prepared_request.lock().ok().and_then(|view| *view);
+            let recording = state
+                .recording_sink
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            let virtual_output = state.virtual_sink.lock().ok().and_then(|slot| slot.clone());
+            let bounded = state.live_only.load(Ordering::Acquire) && recording.is_none();
+            let fast_view = requested.filter(|view| {
+                bounded
+                    && view.rotation == 0
+                    && !view.flip
+                    && view.quad.is_none()
+                    && view.aspect != crate::transform::Aspect::Portrait
+                    && virtual_output
+                        .as_ref()
+                        .is_none_or(|(_, output)| output == view)
+            });
+            let mut cache = Vec::with_capacity(3);
+            let rgb = if let Some(view) = fast_view {
+                let frame = (|| -> Result<Frame, String> {
+                    let (w, h, matrix) = crate::transform::render_plan(
+                        width as u32,
+                        height as u32,
+                        &view,
+                        Some(1920),
+                    )?;
+                    let mut slot = state
+                        .live_processor
+                        .lock()
+                        .map_err(|_| "Processamento de chamada indisponível")?;
+                    if slot.is_none() {
+                        let obsolete = state.blur_processor.lock().ok().and_then(|mut p| p.take());
+                        std::thread::spawn(move || {
+                            drop(obsolete);
+                            crate::quad::release_scratch();
+                        });
+                    }
+                    let processor = slot.get_or_insert_with(crate::live_blur::Processor::default);
+                    let bytes = std::slice::from_raw_parts(
+                        base,
+                        stride.checked_mul(height).ok_or("Stride inválido")?,
+                    );
+                    let pixels = processor.apply(
+                        bytes,
+                        stride,
+                        (width as u32, height as u32),
+                        (w, h),
+                        matrix,
+                        view.background_blur,
+                        received_at,
+                    )?;
+                    Ok((w, h, pixels))
+                })();
+                cache.push((view, frame));
+                Vec::new()
+            } else {
+                if let Ok(mut processor) = state.live_processor.try_lock() {
+                    *processor = None;
                 }
-            }
+                let mut rgb = vec![0; width * height * 3];
+                for row in 0..height {
+                    let source = std::slice::from_raw_parts(base.add(row * stride), width * 4);
+                    let target = &mut rgb[row * width * 3..(row + 1) * width * 3];
+                    for (source, target) in source.chunks_exact(4).zip(target.chunks_exact_mut(3)) {
+                        target.copy_from_slice(&[source[2], source[1], source[0]]);
+                    }
+                }
+                rgb
+            };
             if !state.cancelled.load(Ordering::Acquire) {
                 if let Ok(mut instant) = state.last_valid_frame.lock() {
                     *instant = Some(Instant::now());
                 }
                 // Snapshot only tiny handles under their respective locks. No image
                 // processing or encoder submission holds a control mutex.
-                let requested = state.prepared_request.lock().ok().and_then(|view| *view);
-                let recording = state
-                    .recording_sink
-                    .lock()
-                    .ok()
-                    .and_then(|slot| slot.clone());
-                let virtual_output = state.virtual_sink.lock().ok().and_then(|slot| slot.clone());
                 // At most three distinct views: UI, frozen recording, virtual output.
                 // Matching views share one expensive perspective/crop computation.
-                let mut cache = Vec::with_capacity(3);
+                let limit = bounded.then_some(1920);
                 let prepared = requested.map(|view| {
                     (
                         view,
-                        cached_transform(
+                        cached_live_transform(
                             &mut cache,
                             &state.blur_processor,
                             width as u32,
                             height as u32,
                             &rgb,
                             view,
+                            limit,
                         ),
                     )
                 });
                 if let Some((sink, view)) = recording {
-                    let index = cached_transform(
+                    let index = cached_live_transform(
                         &mut cache,
                         &state.blur_processor,
                         width as u32,
                         height as u32,
                         &rgb,
                         view,
+                        limit,
                     );
                     let submitted = match &cache[index].1 {
                         Ok((_, _, transformed)) => sink.submit_owned(transformed.clone()),
@@ -766,17 +906,39 @@ mod native {
                         }
                     }
                 }
+                let mut source_fingerprint = None;
                 if let Some((sink, view)) = virtual_output.filter(|(sink, _)| sink.wants_frame()) {
-                    let index = cached_transform(
+                    let index = cached_live_transform(
                         &mut cache,
                         &state.blur_processor,
                         width as u32,
                         height as u32,
                         &rgb,
                         view,
+                        limit,
                     );
                     let submitted = match &cache[index].1 {
-                        Ok((w, h, transformed)) => sink.submit_rgb(*w, *h, transformed.clone()),
+                        Ok((w, h, transformed)) => {
+                            let mut pixels = transformed.clone();
+                            if state.trace_frames {
+                                use std::hash::{Hash, Hasher};
+                                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                                pixels.hash(&mut hash);
+                                source_fingerprint = Some(hash.finish());
+                                if let Err(error) = crate::fluency_check::stamp(
+                                    &mut pixels,
+                                    *w,
+                                    *h,
+                                    sequence as u32,
+                                ) {
+                                    if let Ok(mut status) = state.virtual_error.lock() {
+                                        *status = Some(error);
+                                    }
+                                    return;
+                                }
+                            }
+                            sink.submit_rgb_at(*w, *h, pixels, received_at)
+                        }
                         Err(error) => Err(error.clone()),
                     };
                     if let Err(error) = submitted {
@@ -817,11 +979,33 @@ mod native {
                     }
                 }
                 if let Ok(mut slot) = state.frame.lock() {
-                    *slot = Some(TimedFrame {
+                    *slot = (!rgb.is_empty()).then_some(TimedFrame {
                         image: (width as u32, height as u32, rgb),
                         pts_ns,
                         sequence,
                         received_at,
+                    });
+                }
+                if let Ok(mut samples) = state.processing.lock() {
+                    if samples.len() == 120 {
+                        samples.pop_front();
+                    }
+                    samples.push_back(ProcessingSample {
+                        sequence,
+                        source_fingerprint,
+                        received_ns: pts_ns.unwrap_or(0),
+                        total_ms: received_at.elapsed().as_secs_f64() * 1000.0,
+                        bounded,
+                        live: state
+                            .live_processor
+                            .try_lock()
+                            .ok()
+                            .and_then(|p| p.as_ref().map(|p| p.stats())),
+                        blur: state
+                            .blur_processor
+                            .lock()
+                            .ok()
+                            .and_then(|p| p.as_ref().map(|p| p.last_stats())),
                     });
                 }
                 state.frames.fetch_add(1, Ordering::Release);
@@ -944,9 +1128,9 @@ mod native {
         )?;
         let delegate = Owned::new(msg_send![delegate_class(), new], "delegate de vídeo")?;
         (*delegate.0).set_ivar("rustState", Arc::into_raw(shared.clone()) as usize);
-        // Explicitly requested live video must not inherit a background QoS
+        // Interactive A/V deadlines must not inherit a background QoS
         // when the window is minimized. Attribute values are system-owned.
-        let attributes = dispatch_queue_attr_make_with_qos_class(ptr::null(), 0x19, 0);
+        let attributes = dispatch_queue_attr_make_with_qos_class(ptr::null(), 0x21, 0);
         if attributes.is_null() {
             return Err("Falha na prioridade da fila de vídeo".into());
         }
@@ -1024,11 +1208,12 @@ mod native {
         }
         unsafe {
             let _pool = Pool::new();
-            let _activity = crate::video_activity::Activity::begin()?;
+            shared.status("Consultando permissão da câmera…");
             authorize(&shared)?;
             if shared.cancelled.load(Ordering::Acquire) {
                 return Ok(());
             }
+            let _activity = crate::video_activity::Activity::begin()?;
             shared.status(format!("Iniciando prévia de {}…", target.label()));
             let (_session, actual_fps) = open(shared.clone(), width, height, fps, target)?;
             let mut last_frame = Instant::now();
@@ -1064,6 +1249,29 @@ mod native {
     #[cfg(test)]
     mod cache_tests {
         use super::*;
+        #[test]
+        fn closed_window_live_processing_bounds_both_blur_input_and_shared_frame() {
+            let rgb = vec![10; 16 * 8 * 3];
+            let view = crate::transform::FrameTransform {
+                zoom: 1.3,
+                ..Default::default()
+            };
+            let mut cache = Vec::new();
+            let processor = Mutex::new(None);
+            let i = cached_live_transform(&mut cache, &processor, 16, 8, &rgb, view, Some(8));
+            let (w, h, frame) = cache[i].1.as_ref().unwrap();
+            assert_eq!((*w, *h, frame.len()), (8, 4, 96));
+            let allocation = frame.as_ptr();
+            let j = cached_live_transform(&mut cache, &processor, 16, 8, &rgb, view, Some(8));
+            assert_eq!(i, j);
+            assert_eq!(allocation, cache[j].1.as_ref().unwrap().2.as_ptr());
+            let mut full = Vec::new();
+            let j = cached_live_transform(&mut full, &processor, 16, 8, &rgb, view, None);
+            assert_eq!(
+                (full[j].1.as_ref().unwrap().0, full[j].1.as_ref().unwrap().1),
+                (16, 8)
+            );
+        }
         #[test]
         fn matching_consumers_reuse_one_processed_allocation() {
             let rgb = vec![10; 24];

@@ -3,7 +3,14 @@ use crate::{
     model::{self, Preset},
     uvc::{ControlId, ControlState, UvcCamera},
 };
-use std::{collections::BTreeMap, sync::mpsc, thread};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
+};
 
 #[derive(Clone, Default, serde::Serialize)]
 pub struct Snapshot {
@@ -45,6 +52,7 @@ pub enum Command {
 }
 
 pub struct Controller {
+    background: Arc<AtomicBool>,
     tx: mpsc::SyncSender<Command>,
     rx: mpsc::Receiver<Snapshot>,
     captured: mpsc::Receiver<(Option<u64>, Result<Preset, String>)>,
@@ -53,6 +61,10 @@ pub struct Controller {
 
 impl Controller {
     pub fn start() -> Self {
+        let background = Arc::new(AtomicBool::new(
+            std::env::args().any(|arg| arg == "--background"),
+        ));
+        let worker_background = background.clone();
         let (tx, commands) = mpsc::sync_channel(32);
         let (states, rx) = mpsc::channel();
         let (captures, captured) = mpsc::channel();
@@ -71,7 +83,15 @@ impl Controller {
                         if removed {
                             continue;
                         }
-                        let mut current = read_snapshot(&usb, &mut hid);
+                        let mut current = if worker_background.load(Ordering::Acquire) {
+                            background_snapshot(&snapshot, || {
+                                hid.as_mut()
+                                    .map_err(|error| error.clone())?
+                                    .get_byte(hid::commands::GET_DEVICE_MODE)
+                            })
+                        } else {
+                            read_snapshot(&usb, &mut hid)
+                        };
                         current.message.clear();
                         snapshot = current;
                         if states.send(snapshot.clone()).is_err() {
@@ -368,11 +388,15 @@ impl Controller {
             }
         });
         Self {
+            background,
             tx,
             rx,
             captured,
             auto_modes,
         }
+    }
+    pub fn set_background(&self, background: bool) {
+        self.background.store(background, Ordering::Release);
     }
     pub fn send(&self, command: Command) -> Result<(), String> {
         self.tx.try_send(command).map_err(|e| e.to_string())
@@ -397,6 +421,24 @@ impl Controller {
     pub fn auto_mode_results(&self) -> Vec<(u8, Result<(), String>)> {
         self.auto_modes.try_iter().collect()
     }
+}
+
+// Full UVC ranges, firmware, audio endpoints and motor positions are useful in
+// the visible controller, but need not repeatedly interrupt USB video while a
+// call runs in the background. Privacy still gets a fresh mode observation.
+fn background_snapshot(
+    previous: &Snapshot,
+    read_mode: impl FnOnce() -> Result<u8, String>,
+) -> Snapshot {
+    let mut current = previous.clone();
+    current.message.clear();
+    current.vendor.remove("mode");
+    if let Ok(mode) = read_mode() {
+        current
+            .vendor
+            .insert("mode".into(), vec![hid::normalize_device_mode(mode)]);
+    }
+    current
 }
 
 fn set_verified(camera: &UvcCamera, id: ControlId, value: i64) -> Result<(), String> {
@@ -478,6 +520,26 @@ pub fn read_snapshot(
 #[cfg(test)]
 mod completion_tests {
     use super::*;
+
+    #[test]
+    fn background_mode_refresh_keeps_cached_controls_without_reusing_stale_mode() {
+        let mut previous = Snapshot {
+            serial: Some("cached".into()),
+            motor: Some([2.0, 3.0]),
+            ..Default::default()
+        };
+        previous.vendor.insert("mode".into(), vec![1]);
+        previous.vendor.insert("osd".into(), vec![7]);
+        let fresh = background_snapshot(&previous, || Ok(2));
+        assert_eq!(fresh.vendor.get("mode"), Some(&vec![2]));
+        assert_eq!(fresh.serial, previous.serial);
+        assert_eq!(fresh.motor, previous.motor);
+        assert_eq!(fresh.vendor.get("osd"), Some(&vec![7]));
+        let unknown = background_snapshot(&previous, || Err("disconnected".into()));
+        assert!(!unknown.vendor.contains_key("mode"));
+        assert_eq!(previous.vendor.get("mode"), Some(&vec![1]));
+    }
+
     #[test]
     fn later_periodic_snapshot_preserves_command_completion_and_fresh_state() {
         let (tx, _commands) = mpsc::sync_channel(1);
@@ -485,6 +547,7 @@ mod completion_tests {
         let (_captures, captured) = mpsc::channel();
         let (_, auto_modes) = mpsc::channel();
         let controller = Controller {
+            background: Arc::new(AtomicBool::new(false)),
             tx,
             rx,
             captured,
@@ -517,6 +580,7 @@ mod completion_tests {
         let (_captures, captured) = mpsc::channel();
         let (_, auto_modes) = mpsc::channel();
         let controller = Controller {
+            background: Arc::new(AtomicBool::new(false)),
             tx,
             rx,
             captured,

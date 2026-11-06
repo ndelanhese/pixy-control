@@ -275,6 +275,7 @@ impl PixyApp {
         if let Some(path) = &self.telemetry_path {
             let timing = self.preview.as_ref().map(Preview::timing);
             let data = serde_json::json!({"timestamp_ms":timestamp(), "mode":self.camera_mode(),
+                "window_hidden":self.lifecycle.hidden,"window_visible":crate::lifecycle::window_visible(),
                 "auto_privacy":self.auto_privacy_enabled,"restore_mode":self.auto_privacy.restore_mode(), "owned_restore_mode":self.auto_privacy.owned_restore_mode(),
                 "virtual_enabled":self.virtual_enabled,"virtual_status":self.virtual_camera.as_ref().map(|c|c.status()), "virtual_metrics":self.virtual_camera.as_ref().map(|c|c.metrics()),
                 "virtual_consumers":self.usage_sample.as_ref().map(|s|&s.virtual_consumers),
@@ -282,9 +283,10 @@ impl PixyApp {
                 "physical_running":self.usage_sample.as_ref().map(|s|format!("{:?}",s.physical_running)),
                 "usage":self.usage_status,"view":self.view,"format":self.format,
                 "preview_status":self.preview.as_ref().map(Preview::status),"frame_ready":self.frame_ready(),"manual_privacy_lock":self.manual_privacy_lock,
-                "capture_frames":timing.map(|t|t.frames),"capture_width":timing.map(|t|t.width),"capture_height":timing.map(|t|t.height),
+                "processing_samples":self.preview.as_ref().map(|p|p.processing_samples()),"capture_frames":timing.map(|t|t.frames),"capture_width":timing.map(|t|t.width),"capture_height":timing.map(|t|t.height),
                 "capture_retries":self.capture_retries,"notice":self.notice});
-            let _ = model::save_json(path, &data);
+            static WRITER: std::sync::OnceLock<crate::diagnostics::Writer> = std::sync::OnceLock::new();
+            WRITER.get_or_init(crate::diagnostics::Writer::new).submit(path.clone(), data);
         }
     }
     fn sharing_controls(&mut self, ui: &mut egui::Ui) {

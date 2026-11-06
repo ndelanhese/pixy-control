@@ -1,6 +1,7 @@
 //! Scoped user-requested video work: resist App Nap while allowing idle sleep.
 //! Foundation NSProcessInfo.h defines UserInitiatedAllowingIdleSystemSleep as
-//! UserInitiated &~IdleSystemSleepDisabled. No display-sleep or latency-critical flag.
+//! UserInitiated &~IdleSystemSleepDisabled plus LatencyCritical for live A/V.
+//! No system/display sleep prevention; the guard exists only during capture.
 #![allow(unexpected_cfgs)] // objc0.2 emits its historical cargo-clippy feature cfg.
 #[cfg(target_os = "macos")]
 use objc::runtime::Object;
@@ -23,7 +24,7 @@ impl Activity {
         #[cfg(target_os = "macos")]
         {
             objc::rc::autoreleasepool(|| unsafe {
-                const OPTIONS: u64 = 0x00ff_ffffu64 & !(1u64 << 20);
+                const OPTIONS: u64 = (0x00ff_ffffu64 & !(1u64 << 20)) | 0xff_0000_0000u64;
                 let process: *mut Object = msg_send![class!(NSProcessInfo), processInfo];
                 if process.is_null() {
                     return Err("NSProcessInfo indisponível para captura local".into());
@@ -59,15 +60,60 @@ impl Drop for Activity {
 /// CPU-bound video and diagnostic workers have user-initiated scheduling. This
 /// does not change the process priority or disable sleep.
 pub fn prioritize_current_thread() -> Result<(), String> {
+    set_thread_qos(0x19)
+}
+fn set_thread_qos(qos: u32) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         unsafe extern "C" {
             fn pthread_set_qos_class_self_np(qos: u32, relative: i32) -> i32;
         }
-        let code = unsafe { pthread_set_qos_class_self_np(0x19, 0) };
+        let code = unsafe { pthread_set_qos_class_self_np(qos, 0) };
         if code != 0 {
-            return Err(format!("Prioridade do worker de vídeo ({code})"));
+            return Err(format!("Prioridade do worker local ({code})"));
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = qos;
     Ok(())
+}
+
+/// Metadata lookups have no video deadline and must not inherit capture QoS.
+pub fn prioritize_metadata_thread() -> Result<(), String> {
+    set_thread_qos(0x11)
+}
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    #[test]
+    fn metadata_uses_utility_qos_without_changing_the_calling_thread() {
+        unsafe extern "C" {
+            fn pthread_self() -> *mut std::ffi::c_void;
+            fn pthread_get_qos_class_np(
+                thread: *mut std::ffi::c_void,
+                class: *mut u32,
+                relative: *mut i32,
+            ) -> i32;
+        }
+        let class = || unsafe {
+            let mut qos = 0;
+            let mut relative = 0;
+            assert_eq!(
+                pthread_get_qos_class_np(pthread_self(), &mut qos, &mut relative),
+                0
+            );
+            qos
+        };
+        let before = class();
+        let worker_class = std::thread::spawn(move || {
+            super::prioritize_metadata_thread().unwrap();
+            class()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            worker_class, 0x11,
+            "metadata must use Utility, not video QoS"
+        );
+        assert_eq!(class(), before, "the caller's class must be preserved");
+    }
 }

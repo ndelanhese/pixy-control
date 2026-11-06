@@ -47,6 +47,7 @@ impl UsageMonitor {
         });
         let state = shared.clone();
         let worker = thread::spawn(move || {
+            let _ = crate::video_activity::prioritize_metadata_thread();
             while !state.stopped.load(Ordering::Acquire) {
                 let observed = sample();
                 if state.stopped.load(Ordering::Acquire) {

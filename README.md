@@ -2,7 +2,7 @@
 
 A local macOS camera controller written in Rust for the **EMEET PIXY**. Configure the camera, frame your video, blur your background, and send the processed image to other apps through an already installed EMEET virtual camera extension.
 
-No account, cloud processing, network service, or telemetry. Background segmentation runs on the Mac with Apple Vision and Core Image. This is an independent project, not affiliated with or endorsed by EMEET.
+No account, cloud processing, network service, or telemetry. Person segmentation runs on the Mac with Apple Vision; full-resolution effects use Core Image. This is an independent project, not affiliated with or endorsed by EMEET.
 
 **Early development:** tested with one PIXY on Apple Silicon. Hardware compatibility and call-app behavior need validation on additional machines. This repository contains original application source; it does not include EMEET installers, binaries, SDKs, firmware, or its camera extension.
 
@@ -53,7 +53,7 @@ Build the `.app` and launch it normally so macOS can show camera and microphone 
 
 Selecting the physical **EMEET PIXY** bypasses the software crop and blur. Hardware controls still go directly to the camera.
 
-The installed extension accepts **1920×1080 at 30 fps**. Selecting 4K in Pixy Control sets its physical capture format, not the format requested by every other application. Call apps may scale or compress the video independently. A 30 fps transport does not imply 30 different frames when blur or other processing produces fewer.
+The installed extension accepts **1920×1080 at 30 fps**. Selecting 4K in Pixy Control sets its physical capture format, not the format requested by every other application. Call apps may scale or compress the video independently. A 30 fps transport does not by itself prove 30 different camera images. Consumer negotiation, camera exposure, and system load can affect delivered motion.
 
 ```mermaid
 flowchart LR
@@ -87,13 +87,15 @@ Disable automatic startup with `zsh install-background.sh --uninstall`. This rem
 
 ### Performance
 
-Conversion runs separately from the fixed 30 Hz output clock. A bounded two-frame reserve absorbs conversion jitter. Pixel buffers and the video format description are reused; repeated/neutral frames reuse immutable pixels. Without consumers, conversion and publication stop; after five confirmed idle seconds, the producer transport is suspended and resumes when usage returns. Connected clients keep the same active session through capture pauses. Background/minimized UI work is reduced.
+**Known limitation:** intermittent virtual-output stalls remain on the test machine with blur and a hidden window. Recent repeated 60-second measurements did not consistently meet the project's 28.5 distinct fps / 100 ms worst-gap target. These optimizations reduce processing cost; they do not establish parity with the preview or a verified remote Teams/Meet call. The installed vendor extension does not notify changes to its source-client counter, so automatic privacy currently still needs bounded fresh metadata queries.
 
-4K blur costs more than 1080p. For lower resource use, choose 1080p and disable blur when unnecessary. Hardware encoding requires VideoToolbox; recording reports an error instead of silently falling back to a slower software encoder.
+Capture callbacks and the CMIO publisher establish their A/V priority before opening their native queues, including background starts. A latency-critical activity is scoped to camera capture and ends with it. Conversion runs separately from the fixed 30 Hz output clock. A bounded two-frame reserve absorbs conversion jitter. Pixel buffers and the video format description are reused; repeated/neutral frames reuse immutable pixels. The metadata worker runs at Utility priority; its short-lived CMIO reader uses UserInitiated priority. Refreshes are shared and less frequent during active video, avoiding repeated CMIO client connections. Idle polling stays fast; automatic privacy still requires confirmed idle time, so detection and the privacy grace can take several seconds after a call ends. Without consumers, conversion and publication stop; after five confirmed idle seconds, the producer transport is suspended and resumes when usage returns. Connected clients keep the same active session through capture pauses. Background/minimized UI work is reduced. Periodic background hardware refresh reads the privacy mode only; full UVC ranges, firmware, audio and motor snapshots resume when the controller is active. Explicit commands still receive full readback.
+
+For an upright rectangular view with the window hidden or unfocused and no recording active, live framing samples the configured zoom/pan directly from the capture buffer into a bounded 1080p canvas. Person segmentation runs on a separate worker, with a single latest input and expiring masks. Late/missing masks temporarily blur the full image; they never block frame delivery or expose unprocessed input. Native CPU filtering avoids synchronously waiting for GPU/segmentation work on each delivered frame. Photos and recordings still require a full-resolution frame. Rotation, vertical flip and perspective correction retain their original processing path. These paths can have different resource costs. Hardware encoding requires VideoToolbox; recording reports an error instead of silently falling back to a slower software encoder.
 
 ## Data and privacy
 
-Settings and preset thumbnails are stored under `~/Library/Application Support/Pixy Control`. Captures default to `~/Movies/Pixy Control`. The app has no cloud upload or telemetry code; your chosen call app controls any transmission of its camera input.
+Settings and preset thumbnails are stored under `~/Library/Application Support/Pixy Control`. Captures default to `~/Movies/Pixy Control`. The app has no cloud upload or remote telemetry code; your chosen call app controls any transmission of its camera input.
 
 Do not attach camera photos, recordings, serial numbers, personal paths, or unredacted diagnostic dumps to public issues.
 
@@ -113,3 +115,20 @@ Explicit hardware/virtual diagnostics are documented in the [Portuguese guide](d
 ## License
 
 Original project code is licensed under the [MIT License](LICENSE). Dependencies retain their own licenses. EMEET product names and trademarks belong to their owners; the vendor extension is a separate prerequisite and is not covered by this project's license.
+
+### Measuring delivered video
+
+For a local diagnostic consumer, run the bundled executable with
+`--measure-virtual /absolute/path/report.json`. The report measures 60 seconds
+of received images after warm-up, including repeated frames and long gaps;
+it does not save camera images. Native transport sample rate alone is not a
+motion-quality measurement.
+
+A producer started with `--trace-camera-frames` adds a small, CRC-checked frame
+identifier to its virtual output for end-to-end diagnostics. This is visible to
+all virtual-camera clients while that diagnostic instance runs. It is disabled
+in normal launches and does not alter photos or recordings. Optional
+`--sharing-report /absolute/path/report.json` writes bounded processing and
+publication samples asynchronously. Keep diagnostic reports private: they can
+include local settings and paths. Diagnostic consumers do not verify a remote
+Teams/Meet participant's network or received call quality.

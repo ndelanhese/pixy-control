@@ -3,11 +3,14 @@ mod auto_privacy;
 mod background_blur;
 mod capture_idle;
 mod controller;
+mod diagnostics;
 mod exposure;
 mod fluency_check;
 mod hardware_check;
 mod hid;
 mod lifecycle;
+#[cfg(target_os = "macos")]
+mod live_blur;
 mod meter;
 mod model;
 mod preview;
@@ -29,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fresh CMIO metadata process avoids the installed extension's property
     // cache. This path never initializes UI, camera capture or a producer.
     if args.iter().any(|a| a == "--read-virtual-usage") {
+        let _ = video_activity::prioritize_current_thread();
         println!(
             "{}",
             serde_json::to_string(&virtual_camera::raw_consumer_count())?
@@ -60,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("--verify-sharing", virtual_check::persistent_session),
         ("--verify-fluency", fluency_check::run),
         ("--consume-virtual", sharing_check::virtual_consumer),
+        ("--measure-virtual", sharing_check::measure_virtual),
         ("--consume-physical", sharing_check::physical_consumer),
         ("--verify-startup", verification::startup),
         ("--verify-stress", workflow_check::stress),

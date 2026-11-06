@@ -7,6 +7,9 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+fn queue_accepts(depth: i32, capacity: i32) -> bool {
+    depth >= 0 && capacity > 0 && depth < capacity.min(2)
+}
 struct InputFrame {
     width: u32,
     height: u32,
@@ -27,6 +30,7 @@ pub struct PublicationSample {
     pub tick: u64,
     pub sequence: Option<u64>,
     pub scheduled_pts_ns: i64,
+    pub presentation_pts_ns: Option<i64>,
     pub actual_host_ns: i64,
     pub accepted: bool,
     pub source_age_ms: Option<f64>,
@@ -245,20 +249,35 @@ pub fn consumer_state() -> ConsumerState {
 struct UsageCache(Mutex<Option<(std::time::Instant, ConsumerState)>>);
 impl UsageCache {
     fn get(&self, query: impl FnOnce() -> ConsumerState) -> ConsumerState {
+        self.get_at(std::time::Instant::now(), query)
+    }
+    fn get_at(
+        &self,
+        now: std::time::Instant,
+        query: impl FnOnce() -> ConsumerState,
+    ) -> ConsumerState {
         let Ok(mut cached) = self.0.lock() else {
             return ConsumerState::Unknown {
                 reason: "Falha no cache de uso da V-Cam".into(),
             };
         };
         if let Some((updated, value)) = cached.as_ref() {
-            if updated.elapsed() < Duration::from_millis(750) {
+            // Each refresh connects a new CMIO metadata client to the same
+            // provider delivering video. Avoid that churn during active use;
+            // keep idle/unknown polling quick enough to notice a new call.
+            let interval = if value.active() == Some(true) {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(750)
+            };
+            if now.saturating_duration_since(*updated) < interval {
                 return value.clone();
             }
         }
         // Hold the process-global lock through refresh: overlapping UI/producer
         // pollers share one child rather than launching duplicate helpers.
         let value = query();
-        *cached = Some((std::time::Instant::now(), value.clone()));
+        *cached = Some((now, value.clone()));
         value
     }
 }
@@ -422,6 +441,15 @@ impl VirtualSink {
     }
     /// Single newest frame slot; slow output replaces old frames, never blocks capture.
     pub fn submit_rgb(&self, w: u32, h: u32, rgb: Vec<u8>) -> Result<(), String> {
+        self.submit_rgb_at(w, h, rgb, std::time::Instant::now())
+    }
+    pub fn submit_rgb_at(
+        &self,
+        w: u32,
+        h: u32,
+        rgb: Vec<u8>,
+        received: std::time::Instant,
+    ) -> Result<(), String> {
         validate_rgb(w, h, rgb.len())?;
         if !self.wants_frame() {
             return Ok(());
@@ -445,7 +473,7 @@ impl VirtualSink {
                         rgb,
                         sequence,
                         generation: self.shared.generation.load(Ordering::Acquire),
-                        received: std::time::Instant::now(),
+                        received,
                     });
                     self.shared.wake.notify_one();
                 }
@@ -1157,11 +1185,7 @@ mod native {
             result.running = true;
             // Reserve immutable neutral pixels before accepting live input. A
             // privacy transition never requires another pool allocation.
-            result.send(
-                &placeholder_bgra(WIDTH, HEIGHT),
-                None,
-                CMClockGetTime(CMClockGetHostTimeClock()),
-            )?;
+            result.send(&placeholder_bgra(WIDTH, HEIGHT), None)?;
             result.privacy_pixel = result.cached_pixel.take();
             Ok(result)
         }
@@ -1169,10 +1193,12 @@ mod native {
             &mut self,
             bgra: &[u8],
             sequence: Option<u64>,
-            presentation: Time,
-        ) -> Result<bool, String> {
-            if CMSimpleQueueGetCount(self.queue.0) >= CMSimpleQueueGetCapacity(self.queue.0) {
-                return Ok(false);
+        ) -> Result<Option<i64>, String> {
+            if !super::queue_accepts(
+                CMSimpleQueueGetCount(self.queue.0),
+                CMSimpleQueueGetCapacity(self.queue.0),
+            ) {
+                return Ok(None);
             }
             if (sequence.is_some() || self.privacy_pixel.is_none())
                 && (self.cached_pixel.is_none() || self.cached_sequence != sequence)
@@ -1187,7 +1213,7 @@ mod native {
                 // kCVReturnWouldExceedAllocationThreshold: apply bounded
                 // backpressure; never overwrite memory still retained downstream.
                 if code == -6689 {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 check(code, "reutilizar pixel buffer")?;
                 let pixel = Owned(pixel);
@@ -1250,11 +1276,15 @@ mod native {
             }
             .ok_or("V-Cam: imagem ausente")?;
             let format = self.format.as_ref().ok_or("V-Cam: formato ausente")?;
+            // The installed sink's original producer stamps HOST NOW after
+            // rendering, with invalid duration/DTS. Keep capture age separately;
+            // publication-grid timestamps are scheduling diagnostics only.
+            let presentation = CMClockGetTime(CMClockGetHostTimeClock());
             let timing = Timing {
                 duration: Time {
-                    value: 1,
-                    timescale: 30,
-                    flags: 1,
+                    value: 0,
+                    timescale: 0,
+                    flags: 0,
                     epoch: 0,
                 },
                 presentation,
@@ -1288,7 +1318,7 @@ mod native {
             // that +1 to the CMIO output consumer. Its queue callback0x1006c75c8
             // never releases the consumed token. Release only if enqueue fails.
             mem::forget(sample);
-            Ok(true)
+            Ok(Some(host_ns(presentation)))
         }
         unsafe fn resume(&mut self) -> Result<(), String> {
             if !self.running {
@@ -1324,6 +1354,9 @@ mod native {
     ) -> Result<(), String> {
         unsafe {
             let _pool = Pool(msg_send![class!(NSAutoreleasePool), new]);
+            // Establish A/V priority before native transport setup and delivery.
+            // Internal CMIO queue inheritance is not an SDK guarantee.
+            video_qos(0x21)?;
             let mut session = match Session::open() {
                 Ok(session) => session,
                 Err(error) => {
@@ -1340,6 +1373,7 @@ mod native {
             let mut clock = PublicationClock::default();
             let usage_state = state.clone();
             thread::spawn(move || {
+                let _ = crate::video_activity::prioritize_metadata_thread();
                 while !usage_state.stop.load(Ordering::Acquire) {
                     let observed = super::consumer_state();
                     if let Ok(mut value) = usage_state.consumers.lock() {
@@ -1401,11 +1435,7 @@ mod native {
                         if let Ok(mut scratch) = state.conversion_scratch.lock() {
                             *scratch = Vec::new();
                         }
-                        session.send(
-                            &placeholder,
-                            None,
-                            CMClockGetTime(CMClockGetHostTimeClock()),
-                        )?;
+                        session.send(&placeholder, None)?;
                         last_sequence = None;
                         last_enqueue = None;
                         idle = true;
@@ -1448,21 +1478,15 @@ mod native {
                 let scheduled = PublicationClock::scheduled(tick.number);
                 let pts_ns = host_origin_ns
                     .saturating_add(scheduled.as_nanos().min(i64::MAX as u128) as i64);
-                let presentation = Time {
-                    value: pts_ns,
-                    timescale: 1_000_000_000,
-                    flags: 1,
-                    epoch: host.epoch,
-                };
                 let depth = CMSimpleQueueGetCount(session.queue.0).max(0) as u32;
                 let capacity = CMSimpleQueueGetCapacity(session.queue.0).max(0) as u32;
                 let started = Instant::now();
-                let sent = session.send(
+                let presentation_pts_ns = session.send(
                     live.as_ref()
                         .map_or(placeholder.as_slice(), |frame| frame.bgra.as_slice()),
                     sequence,
-                    presentation,
                 )?;
+                let sent = presentation_pts_ns.is_some();
                 let completed = Instant::now();
                 let send_ms = started.elapsed().as_secs_f64() * 1000.0;
                 let gap_ms =
@@ -1496,6 +1520,7 @@ mod native {
                         tick: tick.number,
                         sequence,
                         scheduled_pts_ns: pts_ns,
+                        presentation_pts_ns,
                         actual_host_ns,
                         accepted: sent,
                         source_age_ms,
@@ -1534,6 +1559,56 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn active_cache_avoids_reconnections_but_idle_keeps_fast_wake_detection() {
+        use std::cell::Cell;
+        let cache = UsageCache(Mutex::new(None));
+        let begin = std::time::Instant::now();
+        let calls = Cell::new(0);
+        let read = |ms, value| {
+            cache.get_at(begin + Duration::from_millis(ms), || {
+                calls.set(calls.get() + 1);
+                ConsumerState::Known { count: value }
+            })
+        };
+        assert_eq!(read(0, 1).active(), Some(true));
+        assert_eq!(read(800, 0).active(), Some(true));
+        assert_eq!(read(1600, 0).active(), Some(true));
+        assert_eq!(
+            calls.get(),
+            1,
+            "active capture must not reconnect every 750ms"
+        );
+        assert_eq!(read(2050, 0).active(), Some(false));
+        assert_eq!(read(2550, 1).active(), Some(false));
+        assert_eq!(read(2850, 1).active(), Some(true));
+        assert_eq!(
+            calls.get(),
+            3,
+            "idle must still notice the next call quickly"
+        );
+    }
+    #[test]
+    fn low_latency_queue_never_accumulates_a_call_backlog() {
+        assert!(queue_accepts(0, 10));
+        assert!(queue_accepts(1, 10));
+        assert!(!queue_accepts(2, 10));
+        assert!(!queue_accepts(10, 10));
+        assert!(!queue_accepts(0, 0));
+    }
+    #[test]
+    fn capture_timestamp_is_not_reset_after_slow_processing() {
+        let shared = Arc::new(Shared::new());
+        let sink = VirtualSink {
+            shared: shared.clone(),
+        };
+        let capture = std::time::Instant::now() - Duration::from_millis(400);
+        sink.submit_rgb_at(2, 2, vec![0; 12], capture).unwrap();
+        assert_eq!(
+            shared.frame.lock().unwrap().as_ref().unwrap().received,
+            capture
+        );
+    }
     #[test]
     #[cfg(target_os = "macos")]
     fn conversion_reuses_large_scratch_without_reusing_old_image_pixels() {
