@@ -1,0 +1,15 @@
+/target/
+/dist/
+*.app/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+/work/
+/outputs/
+/verification/
+/captures/
+/recordings/
+settings.json
+presets.json
