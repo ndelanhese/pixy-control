@@ -262,6 +262,7 @@ fn base_pattern(w: u32, h: u32) -> Vec<u8> {
     image
 }
 pub fn run(path: &Path) -> Result<(), String> {
+    crate::video_activity::prioritize_current_thread()?;
     let mut cases = Vec::new();
     for (w, h, fps) in [(1920, 1080, 30), (3840, 2160, 30), (3840, 2160, 21)] {
         cases.push(case(w, h, fps));
@@ -293,6 +294,7 @@ fn case(w: u32, h: u32, fps: u32) -> Value {
     let state = Arc::new(FeedState::default());
     let worker_state = state.clone();
     let feeder = thread::spawn(move || -> Result<(), String> {
+        crate::video_activity::prioritize_current_thread()?;
         let base = base_pattern(w, h);
         let mut last_id = None;
         while !worker_state.stop.load(Ordering::Acquire) {

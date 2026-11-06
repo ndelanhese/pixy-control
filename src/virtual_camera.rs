@@ -1273,6 +1273,16 @@ mod native {
             mem::forget(sample);
             Ok(true)
         }
+        unsafe fn resume(&mut self) -> Result<(), String> {
+            if !self.running {
+                check(
+                    CMIODeviceStartStream(self.device, self.stream),
+                    "retomar transporte virtual",
+                )?;
+                self.running = true;
+            }
+            Ok(())
+        }
         unsafe fn close(&mut self) -> Result<(), String> {
             if self.running {
                 self.running = false;
@@ -1347,6 +1357,7 @@ mod native {
             let mut last_enqueue: Option<Instant> = None;
             let mut current_qos = 0;
             let mut idle = false;
+            let mut idle_since = Instant::now();
             while !state.stop.load(Ordering::Acquire) {
                 let known_idle = state
                     .consumers
@@ -1374,6 +1385,13 @@ mod native {
                         last_sequence = None;
                         last_enqueue = None;
                         idle = true;
+                        idle_since = Instant::now();
+                    }
+                    // No consumer exists across this entire grace. Suspending
+                    // only the idle producer avoids the extension's continuous
+                    // XPC pulls. Active/unknown consumers never take this path.
+                    if idle_since.elapsed() >= Duration::from_secs(5) {
+                        session.close()?;
                     }
                     // No one consumes this output: no continuous sample creation,
                     // IPC pixel transfer, resize, or30Hz producer wakeups.
@@ -1382,6 +1400,7 @@ mod native {
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
+                session.resume()?;
                 idle = false;
                 let elapsed = origin.elapsed();
                 let Some(tick) = clock.due(elapsed) else {
@@ -1391,6 +1410,7 @@ mod native {
                     }
                     continue;
                 };
+                let _frame_pool = Pool(msg_send![class!(NSAutoreleasePool), new]);
                 let live = playout.next(&state);
                 let requested_qos = if live.is_some() { 0x21 } else { 0x15 };
                 if current_qos != requested_qos {

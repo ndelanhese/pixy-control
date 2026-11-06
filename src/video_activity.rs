@@ -55,3 +55,19 @@ impl Drop for Activity {
         });
     }
 }
+
+/// CPU-bound video and diagnostic workers have user-initiated scheduling. This
+/// does not change the process priority or disable sleep.
+pub fn prioritize_current_thread() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos: u32, relative: i32) -> i32;
+        }
+        let code = unsafe { pthread_set_qos_class_self_np(0x19, 0) };
+        if code != 0 {
+            return Err(format!("Prioridade do worker de vídeo ({code})"));
+        }
+    }
+    Ok(())
+}

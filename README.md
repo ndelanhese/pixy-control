@@ -73,7 +73,7 @@ Manual privacy remains locked until you explicitly choose Manual or Tracking. Un
 
 ### Performance
 
-Conversion runs separately from the fixed30Hz output clock. A bounded two-frame reserve absorbs conversion jitter. Pixel buffers and the video format description are reused; repeated/neutral frames reuse immutable pixels. No-consumer output keeps its session connected without continuous frame conversion and publication. Background/minimized UI work is reduced.
+Conversion runs separately from the fixed30Hz output clock. A bounded two-frame reserve absorbs conversion jitter. Pixel buffers and the video format description are reused; repeated/neutral frames reuse immutable pixels. Without consumers, conversion and publication stop; after five confirmed idle seconds, the producer transport is suspended and resumes when usage returns. Connected clients keep the same active session through capture pauses. Background/minimized UI work is reduced.
 
 4K blur costs more than1080p. For lower resource use, choose1080p and disable blur when unnecessary. Hardware encoding requires VideoToolbox; recording reports an error instead of silently falling back to a slower software encoder.
 

@@ -397,6 +397,11 @@ mod native {
     extern "C" {}
     #[link(name = "System")]
     extern "C" {
+        fn dispatch_queue_attr_make_with_qos_class(
+            attribute: *const c_void,
+            qos: u32,
+            priority: i32,
+        ) -> *const c_void;
         fn dispatch_queue_create(label: *const c_char, attribute: *const c_void) -> *mut c_void;
         fn dispatch_sync_f(
             queue: *mut c_void,
@@ -938,7 +943,13 @@ mod native {
         )?;
         let delegate = Owned::new(msg_send![delegate_class(), new], "delegate de vídeo")?;
         (*delegate.0).set_ivar("rustState", Arc::into_raw(shared.clone()) as usize);
-        let queue = dispatch_queue_create(c"local.pixy-control.frames".as_ptr(), ptr::null());
+        // Explicitly requested live video must not inherit a background QoS
+        // when the window is minimized. Attribute values are system-owned.
+        let attributes = dispatch_queue_attr_make_with_qos_class(ptr::null(), 0x19, 0);
+        if attributes.is_null() {
+            return Err("Falha na prioridade da fila de vídeo".into());
+        }
+        let queue = dispatch_queue_create(c"local.pixy-control.frames".as_ptr(), attributes);
         if queue.is_null() {
             return Err("Falha ao criar fila de vídeo.".into());
         }
