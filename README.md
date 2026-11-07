@@ -87,7 +87,7 @@ Disable automatic startup with `zsh install-background.sh --uninstall`. This rem
 
 ### Performance
 
-Physical-camera image processing runs outside the AVFoundation delivery callback, with one retained in-flight sample and one replaceable pending sample. The worker retains the delivery queue's User Interactive priority. Three repeated 60-second physical 4K/strong-blur/hidden-window measurements passed the fixed distinct-image cadence limits. See [verification conditions and app-specific coverage](docs/FLUENCY.md).
+Physical-camera image processing runs outside the AVFoundation delivery callback, with one retained in-flight sample and one replaceable pending sample. The worker retains the delivery queue's User Interactive priority. Four of five 60-second physical 4K/strong-blur/hidden-window measurements passed the fixed distinct-image cadence limits, including the confirmed 720p consumer. One additional 1080p run had a 107 ms gap. See [verification conditions and app-specific coverage](docs/FLUENCY.md).
 
 **Validation limits:** these measurements cover one Mac and a native consumer, plus functional video and privacy checks in a private Meet call. Native Teams fluency and remote-call quality remain unmeasured. The installed vendor extension does not notify changes to its source-client counter, so automatic privacy still needs bounded fresh metadata queries.
 

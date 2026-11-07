@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Isolate physical-camera processing from the AVFoundation callback using a bounded latest-frame mailbox and preserve delivery QoS; three repeated 4K/strong-blur/hidden-window cadence tests passed.
+- Isolate physical-camera processing from the AVFoundation callback using a bounded latest-frame mailbox and preserve delivery QoS; four of five 4K/strong-blur/hidden-window cadence tests passed, including the confirmed 720p output.
 
 - Use bounded native live-call framing and blur with asynchronous person segmentation when the local window is inactive. Preserve full-resolution photos and recordings.
 - Establish native video priority before transport setup, preserve capture age, and bound the downstream queue.

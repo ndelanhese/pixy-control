@@ -13,6 +13,10 @@ Fixed acceptance limits: at least 28.5 distinct images/s, p95 distinct-image gap
 | Run 1 | 29.23 | 36.41 ms | 69.56 ms | Pass |
 | Run 2 | 29.92 | 33.52 ms | 68.32 ms | Pass |
 | Run 3 | 29.90 | 34.13 ms | 67.05 ms | Pass |
+| Additional 1080p run | 29.85 | 37.46 ms | 107.11 ms | Fail |
+| Confirmed 1280×720 consumer | 29.78 | 37.43 ms | 84.43 ms | Pass |
+
+The additional 1080p run was intended to use 720p, but negotiation had not changed when measurement began. Its observed samples were all 1920×1080, so it is reported as 1080p. The subsequent 720p test verified that every measured sample was 1280×720. The remaining 107.11 ms outlier means the final worker has not demonstrated stutter-free delivery in every repetition.
 
 The earlier worker used a lower scheduling class: two repetitions passed, but a third had a 183.45 ms gap and failed. Reducing physical capture to 2K also failed. Those failures were not discarded or counted as successful verification of the final worker.
 
