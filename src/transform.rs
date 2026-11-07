@@ -6,12 +6,43 @@ pub enum Aspect {
     Landscape,
     Portrait,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Backdrop {
+    #[default]
+    Original,
+    Slate,
+    Midnight,
+    Sage,
+}
+impl Backdrop {
+    pub const ALL: [(Self, &str); 4] = [
+        (Self::Original, "Original"),
+        (Self::Slate, "Grafite"),
+        (Self::Midnight, "Azul"),
+        (Self::Sage, "Verde"),
+    ];
+
+    pub fn color(self) -> Option<[u8; 3]> {
+        match self {
+            Self::Original => None,
+            Self::Slate => Some([50, 55, 65]),
+            Self::Midnight => Some([34, 55, 94]),
+            Self::Sage => Some([63, 91, 77]),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FrameTransform {
     #[serde(default)]
     pub quad: Option<crate::quad::Quad>,
     #[serde(default)]
     pub background_blur: f32,
+    #[serde(default)]
+    pub reactions: bool,
+    #[serde(default)]
+    pub studio_light: bool,
+    #[serde(default)]
+    pub backdrop: Backdrop,
     pub rotation: u8,
     pub aspect: Aspect,
     pub zoom: f32,
@@ -25,6 +56,9 @@ impl Default for FrameTransform {
         Self {
             quad: None,
             background_blur: 0.0,
+            reactions: false,
+            studio_light: false,
+            backdrop: Backdrop::Original,
             rotation: 0,
             aspect: Aspect::Original,
             zoom: 1.0,
@@ -34,6 +68,55 @@ impl Default for FrameTransform {
             flip: false,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CameraRoi {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+    pub mirror: bool,
+}
+
+pub(crate) fn camera_roi(
+    size: (u32, u32),
+    canvas: (u32, u32),
+    m: [f64; 8],
+) -> Result<CameraRoi, String> {
+    let (w, h) = (size.0 as usize, size.1 as usize);
+    if w < 2
+        || h < 2
+        || w > 16384
+        || h > 16384
+        || canvas.0 < 2
+        || canvas.1 < 2
+        || canvas.0 > 1920
+        || canvas.1 > 1920
+        || m.iter().any(|v| !v.is_finite())
+        || m[1] != 0.0
+        || m[3] != 0.0
+        || m[6] != 0.0
+        || m[7] != 0.0
+        || m[0] == 0.0
+        || m[4] <= 0.0
+    {
+        return Err("Enquadramento de chamada inválido".into());
+    }
+    let x0 = (m[2] * (w - 1) as f64).round();
+    let x1 = ((m[0] + m[2]) * (w - 1) as f64).round();
+    let y0 = (m[5] * (h - 1) as f64).round();
+    let y1 = ((m[4] + m[5]) * (h - 1) as f64).round();
+    if x0.min(x1) < 0.0 || x0.max(x1) >= w as f64 || y0 < 0.0 || y1 >= h as f64 || y1 < y0 {
+        return Err("Recorte de chamada fora da câmera".into());
+    }
+    Ok(CameraRoi {
+        x: x0.min(x1) as usize,
+        y: y0 as usize,
+        width: (x1 - x0).abs() as usize + 1,
+        height: (y1 - y0) as usize + 1,
+        mirror: x1 < x0,
+    })
 }
 /// Render the same normalized framing within a bounded live-output canvas.
 pub fn apply_bounded(
@@ -365,6 +448,22 @@ mod tests {
     }
     fn reds(rgb: &[u8]) -> Vec<u8> {
         rgb.chunks_exact(3).map(|p| p[0]).collect()
+    }
+
+    #[test]
+    fn previous_settings_keep_framing_and_disable_new_effects() {
+        let previous = serde_json::json!({
+            "background_blur": 0.65, "rotation": 0, "aspect": "Original",
+            "zoom": 1.3, "x": 0.5, "y": 0.5, "mirror": false, "flip": false
+        });
+        let view: FrameTransform = serde_json::from_value(previous).unwrap();
+        assert_eq!(view.background_blur, 0.65);
+        assert_eq!(view.zoom, 1.3);
+        assert!(!view.reactions && !view.studio_light);
+        assert_eq!(view.backdrop, Backdrop::Original);
+        let roundtrip: FrameTransform =
+            serde_json::from_value(serde_json::to_value(view).unwrap()).unwrap();
+        assert_eq!(roundtrip, view);
     }
     #[test]
     fn rotates_clockwise_and_mirrors_asymmetric_pixels() {

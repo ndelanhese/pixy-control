@@ -138,6 +138,7 @@ fn thread_cpu_seconds() -> f64 {
 }
 #[derive(Clone, Copy, Default, serde::Serialize)]
 pub struct Stats {
+    pub gpu_crop: bool,
     pub cpu_ms: f64,
     pub input_ms: f64,
     pub compose_ms: f64,
@@ -150,6 +151,8 @@ pub struct Stats {
 #[derive(Default)]
 pub struct Processor {
     native: native::Buffers,
+    gpu: Option<crate::background_blur::CameraCropper>,
+    gpu_failed: bool,
     worker: Option<Worker>,
     key: Option<((u32, u32), [f64; 8])>,
     generation: u64,
@@ -160,6 +163,7 @@ impl Processor {
     pub fn stats(&self) -> Stats {
         self.stats
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &mut self,
@@ -168,25 +172,95 @@ impl Processor {
         size: (u32, u32),
         canvas: (u32, u32),
         matrix: [f64; 8],
-        amount: f32,
+        effects: (f32, Option<[u8; 3]>, bool),
         received: Instant,
     ) -> Result<Vec<u8>, String> {
+        unsafe {
+            self.apply_inner(
+                None, source, stride, size, canvas, matrix, effects, received,
+            )
+        }
+    }
+    /// # Safety
+    /// The native capture pixel buffer must remain valid during this render.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn apply_camera(
+        &mut self,
+        pixel: *mut std::ffi::c_void,
+        source: &[u8],
+        stride: usize,
+        size: (u32, u32),
+        canvas: (u32, u32),
+        matrix: [f64; 8],
+        effects: (f32, Option<[u8; 3]>, bool),
+        received: Instant,
+    ) -> Result<Vec<u8>, String> {
+        self.apply_inner(
+            Some(pixel),
+            source,
+            stride,
+            size,
+            canvas,
+            matrix,
+            effects,
+            received,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn apply_inner(
+        &mut self,
+        pixel: Option<*mut std::ffi::c_void>,
+        source: &[u8],
+        stride: usize,
+        size: (u32, u32),
+        canvas: (u32, u32),
+        matrix: [f64; 8],
+        effects: (f32, Option<[u8; 3]>, bool),
+        received: Instant,
+    ) -> Result<Vec<u8>, String> {
+        let (amount, backdrop, light) = effects;
         if !amount.is_finite() || !(0.0..=1.0).contains(&amount) {
             return Err("Desfoque inválido".into());
         }
         let start = Instant::now();
         let cpu_start = thread_cpu_seconds();
-        self.native.crop(source, stride, size, canvas, matrix)?;
+        let mut gpu_crop = false;
+        if let Some(pixel) = pixel.filter(|_| !self.gpu_failed) {
+            let result = (|| {
+                if self.gpu.is_none() {
+                    self.gpu = Some(crate::background_blur::CameraCropper::new()?);
+                }
+                self.gpu.as_mut().ok_or("Recorte GPU indisponível")?.crop(
+                    pixel,
+                    size,
+                    canvas,
+                    matrix,
+                    &mut self.native.sharp,
+                )
+            })();
+            match result {
+                Ok(()) => gpu_crop = true,
+                Err(error) => {
+                    eprintln!("Recorte GPU indisponível: {error}");
+                    self.gpu_failed = true;
+                    self.gpu = None;
+                }
+            }
+        }
+        if !gpu_crop {
+            self.native.crop(source, stride, size, canvas, matrix)?;
+        }
         if self.key != Some((canvas, matrix)) {
             self.key = Some((canvas, matrix));
             self.generation = self.generation.wrapping_add(1);
             self.next_mask = None;
         }
-        if amount == 0.0 {
+        if amount == 0.0 && backdrop.is_none() && !light {
             self.worker = None;
             self.next_mask = None;
             let rgb = self.native.sharp_rgb(canvas)?;
             self.stats = Stats {
+                gpu_crop,
                 cpu_ms: (thread_cpu_seconds() - cpu_start) * 1000.0,
                 input_ms: start.elapsed().as_secs_f64() * 1000.0,
                 total_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -224,8 +298,9 @@ impl Processor {
         let compose = Instant::now();
         let rgb = self
             .native
-            .blurred(canvas, amount, mask.as_ref().map(|m| &m.image))?;
+            .blurred(canvas, effects, mask.as_ref().map(|m| &m.image))?;
         self.stats = Stats {
+            gpu_crop,
             cpu_ms: (thread_cpu_seconds() - cpu_start) * 1000.0,
             input_ms,
             compose_ms: compose.elapsed().as_secs_f64() * 1000.0,
@@ -321,7 +396,7 @@ mod native {
     }
     #[derive(Default)]
     pub(super) struct Buffers {
-        sharp: Vec<u8>,
+        pub(super) sharp: Vec<u8>,
         small: Vec<u8>,
         a: Vec<u8>,
         b: Vec<u8>,
@@ -341,42 +416,17 @@ mod native {
         ) -> Result<(), String> {
             let (w, h) = (size.0 as usize, size.1 as usize);
             let (ow, oh) = (canvas.0 as usize, canvas.1 as usize);
-            if w < 2
-                || h < 2
-                || w > 16384
-                || h > 16384
-                || ow < 2
-                || oh < 2
-                || ow > 1920
-                || oh > 1920
-                || stride < w * 4
-                || stride.checked_mul(h).is_none_or(|n| n > bytes.len())
-                || m.iter().any(|v| !v.is_finite())
-                || m[1] != 0.0
-                || m[3] != 0.0
-                || m[6] != 0.0
-                || m[7] != 0.0
-                || m[0] == 0.0
-                || m[4] <= 0.0
-            {
-                return Err("Buffer/enquadramento de chamada inválido".into());
+            let roi = crate::transform::camera_roi(size, canvas, m)?;
+            if stride < w * 4 || stride.checked_mul(h).is_none_or(|n| n > bytes.len()) {
+                return Err("Buffer de chamada inválido".into());
             }
-            let x0 = (m[2] * (w - 1) as f64).round();
-            let x1 = ((m[0] + m[2]) * (w - 1) as f64).round();
-            let y0 = (m[5] * (h - 1) as f64).round();
-            let y1 = ((m[4] + m[5]) * (h - 1) as f64).round();
-            if x0.min(x1) < 0.0
-                || x0.max(x1) >= (w as f64)
-                || y0 < 0.0
-                || y1 >= (h as f64)
-                || y1 < y0
-            {
-                return Err("Recorte de chamada fora da câmera".into());
-            }
-            let x = x0.min(x1) as usize;
-            let y = y0 as usize;
-            let cw = (x1 - x0).abs() as usize + 1;
-            let ch = (y1 - y0) as usize + 1;
+            let crate::transform::CameraRoi {
+                x,
+                y,
+                width: cw,
+                height: ch,
+                mirror,
+            } = roi;
             self.sharp.resize(ow * oh * 4, 0);
             let src = Buffer {
                 data: unsafe { bytes.as_ptr().add(y * stride + x * 4) } as *mut c_void,
@@ -388,7 +438,7 @@ mod native {
             unsafe {
                 scale(&src, &dest, &mut self.temp, false)?;
             }
-            if x1 < x0 {
+            if mirror {
                 for row in self.sharp.chunks_exact_mut(ow * 4) {
                     for x in 0..ow / 2 {
                         for c in 0..4 {
@@ -445,66 +495,71 @@ mod native {
         pub(super) fn blurred(
             &mut self,
             canvas: (u32, u32),
-            amount: f32,
+            effects: (f32, Option<[u8; 3]>, bool),
             mask: Option<&PersonMask>,
         ) -> Result<Vec<u8>, String> {
+            let (amount, backdrop, light) = effects;
             let (w, h) = (canvas.0 as usize, canvas.1 as usize);
             let (sw, sh) = ((w / 4).max(2), (h / 4).max(2));
-            self.a.resize(sw * sh * 4, 0);
-            self.b.resize(sw * sh * 4, 0);
-            self.background.resize(w * h * 4, 0);
+            if amount > 0.0 && backdrop.is_none() {
+                self.a.resize(sw * sh * 4, 0);
+                self.b.resize(sw * sh * 4, 0);
+                self.background.resize(w * h * 4, 0);
+                unsafe {
+                    self.a.copy_from_slice(&self.small);
+                    let k = (((f64::from(amount) * 24.0 * h as f64 / 1080.0 / 4.0 * 2.0).round()
+                        as usize)
+                        | 1)
+                    .min((sw.min(sh) - 1) | 1)
+                    .max(1) as u32;
+                    for _ in 0..3 {
+                        let src = view(&mut self.a, sw, sh, 4);
+                        let dest = view(&mut self.b, sw, sh, 4);
+                        let size = vImageBoxConvolve_ARGB8888(
+                            &src,
+                            &dest,
+                            ptr::null_mut(),
+                            0,
+                            0,
+                            k,
+                            k,
+                            ptr::null(),
+                            8 | 16 | 128,
+                        );
+                        checked(size)?;
+                        self.temp.resize(size as usize, 0);
+                        checked(vImageBoxConvolve_ARGB8888(
+                            &src,
+                            &dest,
+                            if self.temp.is_empty() {
+                                ptr::null_mut()
+                            } else {
+                                self.temp.as_mut_ptr().cast()
+                            },
+                            0,
+                            0,
+                            k,
+                            k,
+                            ptr::null(),
+                            8 | 16,
+                        ))?;
+                        std::mem::swap(&mut self.a, &mut self.b);
+                    }
+                    if sw * 4 == w && sh * 4 == h {
+                        upsample2x(&self.a, sw, sh, &mut self.mid);
+                        upsample2x(&self.mid, sw * 2, sh * 2, &mut self.background);
+                    } else {
+                        scale(
+                            &view(&mut self.a, sw, sh, 4),
+                            &view(&mut self.background, w, h, 4),
+                            &mut self.temp,
+                            false,
+                        )?;
+                    }
+                }
+            }
             self.mask.resize(w * h, 0);
             unsafe {
-                self.a.copy_from_slice(&self.small);
-                let k = (((f64::from(amount) * 24.0 * h as f64 / 1080.0 / 4.0 * 2.0).round()
-                    as usize)
-                    | 1)
-                .min((sw.min(sh) - 1) | 1)
-                .max(1) as u32;
-                for _ in 0..3 {
-                    let src = view(&mut self.a, sw, sh, 4);
-                    let dest = view(&mut self.b, sw, sh, 4);
-                    let size = vImageBoxConvolve_ARGB8888(
-                        &src,
-                        &dest,
-                        ptr::null_mut(),
-                        0,
-                        0,
-                        k,
-                        k,
-                        ptr::null(),
-                        8 | 16 | 128,
-                    );
-                    checked(size)?;
-                    self.temp.resize(size as usize, 0);
-                    checked(vImageBoxConvolve_ARGB8888(
-                        &src,
-                        &dest,
-                        if self.temp.is_empty() {
-                            ptr::null_mut()
-                        } else {
-                            self.temp.as_mut_ptr().cast()
-                        },
-                        0,
-                        0,
-                        k,
-                        k,
-                        ptr::null(),
-                        8 | 16,
-                    ))?;
-                    std::mem::swap(&mut self.a, &mut self.b);
-                }
-                if sw * 4 == w && sh * 4 == h {
-                    upsample2x(&self.a, sw, sh, &mut self.mid);
-                    upsample2x(&self.mid, sw * 2, sh * 2, &mut self.background);
-                } else {
-                    scale(
-                        &view(&mut self.a, sw, sh, 4),
-                        &view(&mut self.background, w, h, 4),
-                        &mut self.temp,
-                        false,
-                    )?;
-                }
                 if let Some(mask) = mask {
                     if mask.width == 0
                         || mask.height == 0
@@ -524,9 +579,112 @@ mod native {
                 }
             }
             let mut rgb = vec![0; w * h * 3];
-            blend(&self.sharp, &self.background, &self.mask, &mut rgb);
+            let background = if amount > 0.0 {
+                &self.background
+            } else {
+                &self.sharp
+            };
+            if backdrop.is_none() && !light {
+                blend(&self.sharp, background, &self.mask, &mut rgb);
+            } else {
+                let background = if backdrop.is_some() {
+                    &self.sharp
+                } else {
+                    background
+                };
+                blend_effects(
+                    &self.sharp,
+                    background,
+                    &self.mask,
+                    &mut rgb,
+                    backdrop,
+                    light,
+                );
+            }
             Ok(rgb)
         }
+    }
+
+    fn blend_effects(
+        sharp: &[u8],
+        background: &[u8],
+        mask: &[u8],
+        rgb: &mut [u8],
+        backdrop: Option<[u8; 3]>,
+        light: bool,
+    ) {
+        let mut processed = 0;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            use std::arch::aarch64::*;
+            while processed + 16 <= mask.len() {
+                let source = vld4q_u8(sharp.as_ptr().add(processed * 4));
+                let back = vld4q_u8(background.as_ptr().add(processed * 4));
+                let matte = vld1q_u8(mask.as_ptr().add(processed));
+                let mut channels = [source.2, source.1, source.0];
+                let back_channels = [back.2, back.1, back.0];
+                for c in 0..3 {
+                    let mut person = channels[c];
+                    let mut bg = backdrop.map_or(back_channels[c], |color| vdupq_n_u8(color[c]));
+                    if light {
+                        person = vqaddq_u8(person, vshrq_n_u8::<2>(person));
+                        if backdrop.is_none() {
+                            let low = vshrn_n_u16::<2>(vmull_u8(vget_low_u8(bg), vdup_n_u8(3)));
+                            let high = vshrn_n_u16::<2>(vmull_u8(vget_high_u8(bg), vdup_n_u8(3)));
+                            bg = vcombine_u8(low, high);
+                        }
+                    }
+                    channels[c] = vcombine_u8(
+                        mix8(vget_low_u8(person), vget_low_u8(bg), vget_low_u8(matte)),
+                        mix8(vget_high_u8(person), vget_high_u8(bg), vget_high_u8(matte)),
+                    );
+                }
+                vst3q_u8(
+                    rgb.as_mut_ptr().add(processed * 3),
+                    uint8x16x3_t(channels[0], channels[1], channels[2]),
+                );
+                processed += 16;
+            }
+        }
+        for (((s, b), &m), out) in sharp[processed * 4..]
+            .chunks_exact(4)
+            .zip(background[processed * 4..].chunks_exact(4))
+            .zip(&mask[processed..])
+            .zip(rgb[processed * 3..].chunks_exact_mut(3))
+        {
+            for c in 0..3 {
+                let person = u16::from(s[2 - c]);
+                let person = if light {
+                    (person * 5 / 4).min(255)
+                } else {
+                    person
+                };
+                let bg = u16::from(backdrop.map_or(b[2 - c], |color| color[c]));
+                let bg = if light && backdrop.is_none() {
+                    bg * 3 / 4
+                } else {
+                    bg
+                };
+                out[c] = ((person * u16::from(m) + bg * u16::from(255 - m) + 127) / 255) as u8;
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn mix8(
+        person: std::arch::aarch64::uint8x8_t,
+        background: std::arch::aarch64::uint8x8_t,
+        mask: std::arch::aarch64::uint8x8_t,
+    ) -> std::arch::aarch64::uint8x8_t {
+        use std::arch::aarch64::*;
+        let sum = vmlal_u8(vmull_u8(person, mask), background, vmvn_u8(mask));
+        let rounded = vaddq_u16(sum, vdupq_n_u16(127));
+        // Exact division by 255 for the full bounded 16-bit blend range.
+        vshrn_n_u16::<8>(vaddq_u16(
+            vaddq_u16(rounded, vdupq_n_u16(1)),
+            vshrq_n_u16::<8>(rounded),
+        ))
     }
     fn blend(sharp: &[u8], background: &[u8], mask: &[u8], rgb: &mut [u8]) {
         for (((s, b), &m), out) in sharp
@@ -677,6 +835,71 @@ mod native {
             );
             assert_eq!(rgb, vec![30, 20, 10, 110, 100, 90, 70, 60, 50]);
         }
+
+        #[test]
+        fn vector_effect_composition_matches_integer_reference() {
+            let sharp: Vec<u8> = (0..1027 * 4).map(|i| ((i * 73 + 19) % 256) as u8).collect();
+            let background: Vec<u8> = (0..1027 * 4).map(|i| ((i * 37 + 81) % 256) as u8).collect();
+            let mask: Vec<u8> = (0..1027).map(|i| (i % 256) as u8).collect();
+            for backdrop in [None, Some([12, 34, 56]), Some([255, 255, 255])] {
+                for light in [false, true] {
+                    let mut actual = vec![0; mask.len() * 3];
+                    blend_effects(&sharp, &background, &mask, &mut actual, backdrop, light);
+                    for (i, (&m, pixel)) in mask.iter().zip(actual.chunks_exact(3)).enumerate() {
+                        for c in 0..3 {
+                            let person = u16::from(sharp[i * 4 + 2 - c]);
+                            let person = if light {
+                                (person * 5 / 4).min(255)
+                            } else {
+                                person
+                            };
+                            let bg =
+                                u16::from(backdrop.map_or(background[i * 4 + 2 - c], |b| b[c]));
+                            let bg = if light && backdrop.is_none() {
+                                bg * 3 / 4
+                            } else {
+                                bg
+                            };
+                            assert_eq!(
+                                pixel[c],
+                                ((person * u16::from(m) + bg * u16::from(255 - m) + 127) / 255)
+                                    as u8
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        #[test]
+        fn studio_light_and_solid_background_share_person_mask() {
+            let source = [80, 120, 160, 255].repeat(16 * 8);
+            let mut processor = Buffers::default();
+            processor
+                .crop(
+                    &source,
+                    64,
+                    (16, 8),
+                    (16, 8),
+                    [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                )
+                .unwrap();
+            processor.prepare_small((16, 8)).unwrap();
+            for (mask_value, expected) in [(255, [200, 150, 100]), (0, [12, 34, 56])] {
+                let mask = PersonMask {
+                    width: 16,
+                    height: 8,
+                    pixels: vec![mask_value; 128],
+                };
+                let output = processor
+                    .blurred((16, 8), (0.0, Some([12, 34, 56]), true), Some(&mask))
+                    .unwrap();
+                assert!(output.chunks_exact(3).all(|p| p == expected));
+            }
+            let output = processor
+                .blurred((16, 8), (0.0, Some([12, 34, 56]), true), None)
+                .unwrap();
+            assert!(output.chunks_exact(3).all(|p| p == [12, 34, 56]));
+        }
         #[test]
         fn native_crop_uses_padded_camera_rows_and_exact_selected_roi() {
             let mut b = vec![199; 72 * 8];
@@ -768,7 +991,7 @@ mod tests {
             (64, 32),
             (64, 32),
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
-            0.8,
+            (0.8, None, false),
             Instant::now(),
         );
         let elapsed = start.elapsed();

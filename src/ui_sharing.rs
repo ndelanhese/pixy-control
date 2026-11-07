@@ -15,6 +15,7 @@ impl PixyApp {
     fn current_settings(&self) -> Settings {
         Settings {
             view: self.view,
+            edge_light: self.edge_light_enabled,
             format: self.format,
             audio: self.record_audio,
             folder: self.output_folder.clone(),
@@ -101,6 +102,9 @@ impl PixyApp {
                     self.auto_privacy
                         .command_finished(now, Action::Restore(mode), false);
                 }
+            } else if self.preview.as_ref().is_some_and(Preview::authorization_pending) {
+                // Start the USB grace period after the consent dialog finishes.
+                self.wake_mode = Some((mode, std::time::Instant::now()));
             } else if started.elapsed() > Duration::from_secs(8) {
                 self.wake_mode = None;
                 self.hardware_busy = false;
@@ -276,13 +280,16 @@ impl PixyApp {
             let timing = self.preview.as_ref().map(Preview::timing);
             let data = serde_json::json!({"timestamp_ms":timestamp(), "mode":self.camera_mode(),
                 "window_hidden":self.lifecycle.hidden,"window_visible":crate::lifecycle::window_visible(),
+                "edge_light_visible":self.edge_light.visible(),
                 "auto_privacy":self.auto_privacy_enabled,"restore_mode":self.auto_privacy.restore_mode(), "owned_restore_mode":self.auto_privacy.owned_restore_mode(),
                 "virtual_enabled":self.virtual_enabled,"virtual_status":self.virtual_camera.as_ref().map(|c|c.status()), "virtual_metrics":self.virtual_camera.as_ref().map(|c|c.metrics()),
                 "virtual_consumers":self.usage_sample.as_ref().map(|s|&s.virtual_consumers),
                 "physical_usage":self.usage_sample.as_ref().map(|s|format!("{:?}",s.physical)),
                 "physical_running":self.usage_sample.as_ref().map(|s|format!("{:?}",s.physical_running)),
                 "usage":self.usage_status,"view":self.view,"format":self.format,
+                "authorization_pending":self.preview.as_ref().is_some_and(Preview::authorization_pending),
                 "preview_status":self.preview.as_ref().map(Preview::status),"frame_ready":self.frame_ready(),"manual_privacy_lock":self.manual_privacy_lock,
+                "reaction_exercise_count":self.reaction_exercise.map(|(_, count)| count),
                 "processing_samples":self.preview.as_ref().map(|p|p.processing_samples()),"capture_frames":timing.map(|t|t.frames),"capture_width":timing.map(|t|t.width),"capture_height":timing.map(|t|t.height),
                 "capture_retries":self.capture_retries,"notice":self.notice});
             static WRITER: std::sync::OnceLock<crate::diagnostics::Writer> = std::sync::OnceLock::new();
@@ -348,12 +355,44 @@ impl PixyApp {
             if studio_switch(ui, &mut enabled, "Desfocar fundo").changed() {
                 self.view.background_blur = if enabled { 0.65 } else { 0.0 };
             }
-            if enabled {
+            if enabled && self.view.backdrop == crate::transform::Backdrop::Original {
                 ui.label("Intensidade do desfoque");
                 ui.add(egui::Slider::new(&mut self.view.background_blur, 0.1..=1.0).step_by(0.05));
             }
         });
-        ui.small("Processamento local no Mac. Aplicado à prévia, fotos, vídeos e câmera virtual.");
+        ui.add_enabled_ui(self.recorder.is_none(), |ui| {
+            use crate::transform::Backdrop;
+            studio_switch(ui, &mut self.view.studio_light, "Iluminação de estúdio");
+            studio_switch(ui, &mut self.edge_light_enabled, "Luz de borda da tela")
+                .on_hover_text("Borda branca na tela principal para iluminar o rosto. Apaga ao parar a câmera.");
+            let selected = Backdrop::ALL.iter().find(|(option, _)| *option == self.view.backdrop);
+            egui::ComboBox::from_label("Fundo virtual")
+                .selected_text(selected.map_or("Original", |(_, label)| *label))
+                .show_ui(ui, |ui| {
+                    for (option, label) in Backdrop::ALL {
+                        ui.selectable_value(&mut self.view.backdrop, option, label);
+                    }
+                });
+            studio_switch(ui, &mut self.view.reactions, "Reações por gestos")
+                .on_hover_text("Segure o gesto por meio segundo. Afaste as mãos do rosto. Solte antes de repetir.");
+            ui.collapsing("Gestos disponíveis", |ui| {
+                ui.small("👍 Joinha · 👎 Polegar para baixo · ✌ Vitória → balões");
+                ui.small("Duas mãos formando coração → corações");
+                ui.small("Dois joinhas → fogos · Dois polegares para baixo → chuva");
+                ui.small("Duas vitórias → confete · Dois sinais de rock → lasers");
+            });
+        });
+        ui.menu_button("Enviar reação", |ui| {
+            for (reaction, label) in crate::reactions::Reaction::ALL {
+                if ui.add_enabled(self.preview.is_some(), egui::Button::new(label)).clicked() {
+                    if let Some(preview) = &self.preview {
+                        preview.react(reaction);
+                    }
+                    ui.close_menu();
+                }
+            }
+        });
+        ui.small("Efeitos locais na prévia e na câmera virtual. O fundo virtual substitui o desfoque.");
         ui.add_space(16.0);
     }
 }

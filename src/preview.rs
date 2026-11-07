@@ -54,6 +54,8 @@ struct Shared {
     frame: Mutex<Option<TimedFrame>>,
     status: Mutex<String>,
     cancelled: AtomicBool,
+    permission_pending: AtomicBool,
+    system_reactions_supported: AtomicBool,
     finished: AtomicBool,
     frames: AtomicU64,
     last_valid_frame: Mutex<Option<std::time::Instant>>,
@@ -82,6 +84,9 @@ struct Shared {
     virtual_error: Mutex<Option<String>>,
     blur_processor: Mutex<Option<crate::background_blur::Processor>>,
     trace_frames: bool,
+    reaction_request: Mutex<Option<crate::reactions::Reaction>>,
+    #[cfg(target_os = "macos")]
+    reactions: Mutex<crate::reactions::Live>,
     virtual_target: AtomicBool,
     live_only: AtomicBool,
     #[cfg(target_os = "macos")]
@@ -96,6 +101,8 @@ impl Shared {
             frame: Mutex::new(None),
             status: Mutex::new("Aguardando permissão da câmera…".into()),
             cancelled: AtomicBool::new(false),
+            permission_pending: AtomicBool::new(false),
+            system_reactions_supported: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             frames: AtomicU64::new(0),
             last_valid_frame: Mutex::new(None),
@@ -115,6 +122,9 @@ impl Shared {
             blur_processor: Mutex::new(None),
             trace_frames: std::env::args().any(|a| a == "--trace-camera-frames"),
             virtual_target: AtomicBool::new(false),
+            reaction_request: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            reactions: Mutex::new(crate::reactions::Live::default()),
             live_only: AtomicBool::new(false),
             #[cfg(target_os = "macos")]
             live_processor: Mutex::new(None),
@@ -152,6 +162,18 @@ pub struct Preview {
     shared: Arc<Shared>,
 }
 impl Preview {
+    pub fn authorization_pending(&self) -> bool {
+        !self.shared.cancelled.load(Ordering::Acquire)
+            && !self.shared.finished.load(Ordering::Acquire)
+            && self.shared.permission_pending.load(Ordering::Acquire)
+    }
+
+    pub fn react(&self, reaction: crate::reactions::Reaction) {
+        if let Ok(mut request) = self.shared.reaction_request.lock() {
+            *request = Some(reaction);
+        }
+    }
+
     /// Only the live 1080p output is needed while no local window is displayed.
     pub fn set_live_only(&self, value: bool) {
         self.shared.live_only.store(value, Ordering::Release);
@@ -530,6 +552,8 @@ mod native {
                 0 => {},
                 _ => return Err(format!("Estado desconhecido da permissão da câmera: {status}")),
             }
+            shared.permission_pending.store(true, Ordering::Release);
+            crate::lifecycle::show_camera_consent();
             let (tx, rx) = mpsc::sync_channel(1);
             let completion = ConcreteBlock::new(move |allowed: BOOL| {
                 let _ = tx.try_send(allowed != NO);
@@ -539,22 +563,24 @@ mod native {
             // AVFoundation copies the completion block for its asynchronous reply. The
             // local retained block also survives until this permission wait completes.
             let deadline = Instant::now() + Duration::from_secs(120);
-            loop {
+            let result = loop {
                 if shared.cancelled.load(Ordering::Acquire) {
-                    return Ok(());
+                    break Ok(());
                 }
                 match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(true) => return Ok(()),
-                    Ok(false) => return Err("Permissão da câmera negada pelo macOS.".into()),
+                    Ok(true) => break Ok(()),
+                    Ok(false) => break Err("Permissão da câmera negada pelo macOS.".into()),
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err("Falha ao consultar permissão da câmera.".into())
+                        break Err("Falha ao consultar permissão da câmera.".into())
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
-                        return Err("Permissão da câmera ainda pendente.".into())
+                        break Err("Permissão da câmera ainda pendente.".into())
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-            }
+            };
+            shared.permission_pending.store(false, Ordering::Release);
+            result
         }
     }
 
@@ -669,19 +695,24 @@ mod native {
         let frame = (|| -> Result<Frame, String> {
             let (w, h, mut pixels) =
                 crate::transform::apply_bounded(width, height, rgb.to_vec(), &view, limit)?;
-            if view.background_blur != 0.0 {
+            if view.background_blur != 0.0 || view.backdrop.color().is_some() || view.studio_light {
                 let mut slot = processor
                     .lock()
                     .map_err(|_| "Falha no processador de desfoque")?;
                 if slot.is_none() {
                     *slot = Some(crate::background_blur::Processor::new()?);
                 }
-                pixels = slot.as_mut().ok_or("Desfoque indisponível")?.apply(
-                    w,
-                    h,
-                    pixels,
-                    view.background_blur,
-                )?;
+                pixels = slot
+                    .as_mut()
+                    .ok_or("Desfoque indisponível")?
+                    .apply_effects(
+                        w,
+                        h,
+                        pixels,
+                        view.background_blur,
+                        view.backdrop.color(),
+                        view.studio_light,
+                    )?;
             }
             Ok((w, h, pixels))
         })();
@@ -703,19 +734,24 @@ mod native {
         // segmentation, so a90/180-degree output never makes the subject vanish.
         let frame = (|| -> Result<Frame, String> {
             let mut pixels = rgb.to_vec();
-            if view.background_blur != 0.0 {
+            if view.background_blur != 0.0 || view.backdrop.color().is_some() || view.studio_light {
                 let mut slot = processor
                     .lock()
                     .map_err(|_| "Falha no processador de desfoque")?;
                 if slot.is_none() {
                     *slot = Some(crate::background_blur::Processor::new()?);
                 }
-                pixels = slot.as_mut().ok_or("Desfoque indisponível")?.apply(
-                    width,
-                    height,
-                    pixels,
-                    view.background_blur,
-                )?;
+                pixels = slot
+                    .as_mut()
+                    .ok_or("Desfoque indisponível")?
+                    .apply_effects(
+                        width,
+                        height,
+                        pixels,
+                        view.background_blur,
+                        view.backdrop.color(),
+                        view.studio_light,
+                    )?;
             }
             crate::transform::apply(width, height, pixels, &view)
         })();
@@ -838,12 +874,39 @@ mod native {
                 .ok()
                 .and_then(|slot| slot.clone());
             let virtual_output = state.virtual_sink.lock().ok().and_then(|slot| slot.clone());
+            // Native gestures already render into supported capture formats.
+            // Avoid composing a second local effect for the same gesture.
+            let system_gestures: BOOL =
+                msg_send![class!(AVCaptureDevice), reactionEffectGesturesEnabled];
+            let system_handles_gestures =
+                system_gestures != NO && state.system_reactions_supported.load(Ordering::Acquire);
+            let gestures = !system_handles_gestures
+                && !state.virtual_target.load(Ordering::Acquire)
+                && (requested.is_some_and(|view| view.reactions)
+                    || virtual_output
+                        .as_ref()
+                        .is_some_and(|(_, view)| view.reactions)
+                    || recording.as_ref().is_some_and(|(_, view)| view.reactions));
+            let manual = state
+                .reaction_request
+                .try_lock()
+                .ok()
+                .and_then(|mut r| r.take());
+            let reaction = state.reactions.try_lock().ok().and_then(|mut live| {
+                live.update(
+                    gestures,
+                    manual,
+                    std::slice::from_raw_parts(base, stride * height),
+                    stride,
+                    (width, height),
+                )
+            });
             let bounded = state.live_only.load(Ordering::Acquire) && recording.is_none();
             let fast_view = requested.filter(|view| {
                 bounded
                     && view.rotation == 0
                     && !view.flip
-                    && view.quad.is_none()
+                    && view.quad.is_none_or(|quad| quad == crate::quad::FULL_QUAD)
                     && view.aspect != crate::transform::Aspect::Portrait
                     && virtual_output
                         .as_ref()
@@ -874,13 +937,18 @@ mod native {
                         base,
                         stride.checked_mul(height).ok_or("Stride inválido")?,
                     );
-                    let pixels = processor.apply(
+                    let pixels = processor.apply_camera(
+                        buffer,
                         bytes,
                         stride,
                         (width as u32, height as u32),
                         (w, h),
                         matrix,
-                        view.background_blur,
+                        (
+                            view.background_blur,
+                            view.backdrop.color(),
+                            view.studio_light,
+                        ),
                         received_at,
                     )?;
                     Ok((w, h, pixels))
@@ -935,7 +1003,13 @@ mod native {
                         limit,
                     );
                     let submitted = match &cache[index].1 {
-                        Ok((_, _, transformed)) => sink.submit_owned(transformed.clone()),
+                        Ok((w, h, transformed)) => {
+                            let mut pixels = transformed.clone();
+                            if let Some((effect, elapsed)) = reaction {
+                                crate::reactions::draw(&mut pixels, *w, *h, effect, elapsed);
+                            }
+                            sink.submit_owned(pixels)
+                        }
                         Err(error) => Err(error.clone()),
                     };
                     if let Err(error) = submitted {
@@ -958,6 +1032,9 @@ mod native {
                     let submitted = match &cache[index].1 {
                         Ok((w, h, transformed)) => {
                             let mut pixels = transformed.clone();
+                            if let Some((effect, elapsed)) = reaction {
+                                crate::reactions::draw(&mut pixels, *w, *h, effect, elapsed);
+                            }
                             if state.trace_frames {
                                 use std::hash::{Hash, Hasher};
                                 let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -992,7 +1069,16 @@ mod native {
                     // Move the prepared allocation into its bounded latest slot;
                     // queues above copied only when they need independent ownership.
                     match cache.swap_remove(index).1 {
-                        Ok(frame) => {
+                        Ok(mut frame) => {
+                            if let Some((effect, elapsed)) = reaction {
+                                crate::reactions::draw(
+                                    &mut frame.2,
+                                    frame.0,
+                                    frame.1,
+                                    effect,
+                                    elapsed,
+                                );
+                            }
                             if let Ok(mut time) = state.last_prepared_frame.lock() {
                                 *time = Some(Instant::now());
                             }
@@ -1252,6 +1338,11 @@ mod native {
         trace_configuration(&shared, "after_start", selected.device, &capture);
         drop(configuration_lock);
         trace_configuration(&shared, "after_unlock", selected.device, &capture);
+        let format: *mut Object = msg_send![selected.device, activeFormat];
+        let reactions: BOOL = msg_send![format, reactionEffectsSupported];
+        shared
+            .system_reactions_supported
+            .store(reactions != NO, Ordering::Release);
         let running: BOOL = msg_send![capture.session.0, isRunning];
         if running == NO {
             return Err("AVFoundation não iniciou a sessão da Pixy.".into());
@@ -1381,6 +1472,21 @@ mod tests {
         Preview {
             shared: Arc::new(Shared::new(4, 2)),
         }
+    }
+
+    #[test]
+    fn stopped_capture_never_reports_pending_permission() {
+        let preview = Preview {
+            shared: Arc::new(Shared::new(4, 2)),
+        };
+        assert!(!preview.authorization_pending());
+        preview
+            .shared
+            .permission_pending
+            .store(true, Ordering::Release);
+        assert!(preview.authorization_pending());
+        preview.shared.cancelled.store(true, Ordering::Release);
+        assert!(!preview.authorization_pending());
     }
     #[test]
     fn taking_an_old_frame_does_not_make_it_fresh_and_stop_invalidates() {

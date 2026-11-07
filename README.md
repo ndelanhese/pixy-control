@@ -15,12 +15,12 @@ No account, cloud processing, network service, or telemetry. Person segmentation
 | Camera | Manual, firmware tracking, privacy, pan/tilt, eight presets, startup position |
 | Image | Focus, exposure, white balance, brightness, contrast, saturation, sharpness, anti-flicker |
 | Framing | Digital zoom, crop, rotation, mirror, aspect ratio, four-corner perspective |
-| Effects | Adjustable local background blur with person segmentation |
+| Effects | Adjustable local blur, three solid virtual backgrounds, studio lighting, screen edge light, eight gesture reactions |
 | Capture | Live preview, PNG photos, hardware-encoded H.264 video, optional microphone, recording segments |
 | Sharing | Processed output through the installed EMEET virtual camera, persistent pause/resume session |
 | Privacy | Idle detection, return to previous Manual/Tracking mode, manual privacy lock |
 
-Availability depends on the firmware and video mode. Firmware tracking and gestures run locally on the camera. Beauty effects, cloud features, streaming platforms, and accounts from the vendor app are excluded.
+Availability depends on the firmware and video mode. Firmware tracking and camera-control gestures run locally on the camera. Hand-gesture reactions run locally on the Mac through Apple Vision. Beauty effects, cloud features, streaming platforms, and accounts from the vendor app are excluded.
 
 ## Requirements
 
@@ -50,6 +50,10 @@ Build the `.app` and launch it normally so macOS can show camera and microphone 
 1. Leave Pixy Control running and enable **V-Cam → Ativar câmera virtual**.
 2. In the call app, select **EMEET STUDIO Virtual Camera**.
 3. Configure framing and **Efeitos → Desfocar fundo** in Pixy Control.
+
+Under **Efeitos**, enable **Reações por gestos** and hold a gesture for about half a second. Release before repeating. **Enviar reação** also triggers effects manually from the app or the **Pixy** status menu, including with the main window closed. Studio lighting and the solid backgrounds use the existing person mask. Optional **Luz de borda da tela** illuminates your face with a static white screen border while capture is active.
+
+The reaction set includes hearts, thumbs-up/down, balloons, confetti, fireworks, rain and lasers. The local renderer uses lightweight 2D animations. Supported capture formats can also receive native reactions enabled in the macOS Video menu. Pixy skips its local gesture detector while those native gestures are enabled. See the [effect controls and test coverage](docs/LOCAL-EFFECTS.md).
 
 Selecting the physical **EMEET PIXY** bypasses the software crop and blur. Hardware controls still go directly to the camera.
 
@@ -89,11 +93,11 @@ Disable automatic startup with `zsh install-background.sh --uninstall`. This rem
 
 Physical-camera image processing runs outside the AVFoundation delivery callback, with one retained in-flight sample and one replaceable pending sample. The worker retains the delivery queue's User Interactive priority. Four of five 60-second physical 4K/strong-blur/hidden-window measurements passed the fixed distinct-image cadence limits, including the confirmed 720p consumer. One additional 1080p run had a 107 ms gap. See [verification conditions and app-specific coverage](docs/FLUENCY.md).
 
-**Validation limits:** these measurements cover one Mac and a native consumer, plus functional video and privacy checks in a private Meet call. Native Teams fluency and remote-call quality remain unmeasured. The installed vendor extension does not notify changes to its source-client counter, so automatic privacy still needs bounded fresh metadata queries.
+**Validation limits:** these measurements cover one Mac and a native consumer, plus functional video and privacy checks in a private Meet call. Native Teams preview now has a functional blur check. Teams renderer cadence and remote-call quality remain unmeasured. Additional local-effect trials are recorded in docs/LOCAL-EFFECTS.md. The installed vendor extension does not notify changes to its source-client counter, so automatic privacy still needs bounded fresh metadata queries.
 
 Capture callbacks and the CMIO publisher establish their A/V priority before opening their native queues, including background starts. A latency-critical activity is scoped to camera capture and ends with it. Conversion runs separately from the fixed 30 Hz output clock. A bounded two-frame reserve absorbs conversion jitter. Pixel buffers and the video format description are reused; repeated/neutral frames reuse immutable pixels. The metadata worker runs at Utility priority; its short-lived CMIO reader uses UserInitiated priority. Refreshes are shared and less frequent during active video, avoiding repeated CMIO client connections. Idle polling stays fast; automatic privacy still requires confirmed idle time, so detection and the privacy grace can take several seconds after a call ends. Without consumers, conversion and publication stop; after five confirmed idle seconds, the producer transport is suspended and resumes when usage returns. Connected clients keep the same active session through capture pauses. Background/minimized UI work is reduced. Periodic background hardware refresh reads the privacy mode only; full UVC ranges, firmware, audio and motor snapshots resume when the controller is active. Explicit commands still receive full readback.
 
-For an upright rectangular view with the window hidden or unfocused and no recording active, live framing samples the configured zoom/pan directly from the capture buffer into a bounded 1080p canvas. Person segmentation runs on a separate worker, with a single latest input and expiring masks. Late/missing masks temporarily blur the full image; they never block frame delivery or expose unprocessed input. Native CPU filtering avoids synchronously waiting for GPU/segmentation work on each delivered frame. Photos and recordings still require a full-resolution frame. Rotation, vertical flip and perspective correction retain their original processing path. These paths can have different resource costs. Hardware encoding requires VideoToolbox; recording reports an error instead of silently falling back to a slower software encoder.
+For an upright rectangular view with the window hidden or unfocused and no recording active, live framing samples the configured zoom/pan directly from the capture buffer into a bounded 1080p canvas. Person segmentation runs on a separate worker, with a single latest input and expiring masks. Late/missing masks temporarily blur the full image; they never block frame delivery or expose unprocessed input. Metal and Core Image resample the live crop into a reusable surface. Accelerate supplies the CPU fallback and blur, and Apple Silicon vector instructions compose the local lighting. Hand detection and person segmentation run independently of frame delivery. Photos and recordings still require a full-resolution frame. Rotation, vertical flip and perspective correction retain their original processing path. These paths can have different resource costs. Hardware encoding requires VideoToolbox; recording reports an error instead of silently falling back to a slower software encoder.
 
 ## Data and privacy
 

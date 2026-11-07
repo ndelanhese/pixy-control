@@ -28,6 +28,7 @@ struct Settings {
     auto_privacy_restore: Option<u8>,
     auto_privacy_hint: Option<u8>,
     manual_privacy_lock: bool,
+    edge_light: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -42,6 +43,7 @@ impl Default for Settings {
             auto_privacy_restore: None,
             auto_privacy_hint: None,
             manual_privacy_lock: false,
+            edge_light: false,
         }
     }
 }
@@ -115,6 +117,9 @@ pub struct PixyApp {
     retry_at: Option<std::time::Instant>,
     capture_retries: u8,
     last_settings: Option<Vec<u8>>,
+    reaction_exercise: Option<(std::time::Instant, usize)>,
+    edge_light_enabled: bool,
+    edge_light: crate::lifecycle::EdgeLight,
     telemetry_path: Option<PathBuf>,
     telemetry_at: std::time::Instant,
 }
@@ -227,6 +232,11 @@ impl PixyApp {
             retry_at: None,
             capture_retries: 0,
             last_settings: None,
+            edge_light_enabled: settings.edge_light,
+            edge_light: crate::lifecycle::EdgeLight::default(),
+            reaction_exercise: std::env::args()
+                .any(|arg| arg == "--exercise-reactions")
+                .then(|| (std::time::Instant::now(), 0)),
             telemetry_path: {
                 let args: Vec<String> = std::env::args().collect();
                 args.iter()
@@ -752,6 +762,19 @@ impl PixyApp {
 
 impl eframe::App for PixyApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.edge_light
+            .update(self.edge_light_enabled && self.frame_ready());
+        if self.frame_ready() {
+            if let Some((last, index)) = &mut self.reaction_exercise {
+                if last.elapsed() >= Duration::from_secs(4) {
+                    if let Some(preview) = &self.preview {
+                        preview.react(crate::reactions::Reaction::ALL[*index % 8].0);
+                        *last = std::time::Instant::now();
+                        *index += 1;
+                    }
+                }
+            }
+        }
         match crate::lifecycle::take_action() {
             1 => {
                 self.lifecycle.reopen();
@@ -763,6 +786,12 @@ impl eframe::App for PixyApp {
             2 => {
                 self.lifecycle.quitting = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            11 => crate::lifecycle::activate(),
+            action @ 3..=10 => {
+                if let Some(preview) = &self.preview {
+                    preview.react(crate::reactions::Reaction::ALL[usize::from(action - 3)].0);
+                }
             }
             _ => {}
         }
@@ -1043,6 +1072,7 @@ impl eframe::App for PixyApp {
         }
     }
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.edge_light.update(false);
         if !self.manual_privacy_lock {
             if let Some(mode @ 0..=1) = self
                 .wake_mode

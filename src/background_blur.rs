@@ -82,8 +82,20 @@ impl Processor {
         rgb: Vec<u8>,
         amount: f32,
     ) -> Result<Vec<u8>, String> {
+        self.apply_effects(width, height, rgb, amount, None, false)
+    }
+
+    pub fn apply_effects(
+        &mut self,
+        width: u32,
+        height: u32,
+        rgb: Vec<u8>,
+        amount: f32,
+        backdrop: Option<[u8; 3]>,
+        light: bool,
+    ) -> Result<Vec<u8>, String> {
         validate(width, height, rgb.len(), amount)?;
-        if amount == 0.0 {
+        if amount == 0.0 && backdrop.is_none() && !light {
             return Ok(rgb);
         }
         #[cfg(target_os = "macos")]
@@ -96,7 +108,9 @@ impl Processor {
             {
                 self.native.reset_sequence()?;
             }
-            let (output, stats) = self.native.apply(width, height, rgb, amount)?;
+            let (output, stats) = self
+                .native
+                .apply(width, height, rgb, amount, backdrop, light)?;
             self.stats = stats;
             self.last_frame = Some(Instant::now());
             Ok(output)
@@ -173,6 +187,29 @@ fn reference_blend(sharp: &[u8], background: &[u8], mask: &[u8]) -> Result<Vec<u
         })
         .collect())
 }
+
+#[cfg(target_os = "macos")]
+pub struct CameraCropper(native::CameraCropper);
+#[cfg(target_os = "macos")]
+unsafe impl Send for CameraCropper {}
+#[cfg(target_os = "macos")]
+impl CameraCropper {
+    pub fn new() -> Result<Self, String> {
+        Ok(Self(native::CameraCropper::new()?))
+    }
+    /// # Safety
+    /// The capture pixel buffer must stay valid until the synchronous render completes.
+    pub unsafe fn crop(
+        &mut self,
+        buffer: *mut std::ffi::c_void,
+        size: (u32, u32),
+        canvas: (u32, u32),
+        matrix: [f64; 8],
+        pixels: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        self.0.crop(buffer, size, canvas, matrix, pixels)
+    }
+}
 #[cfg(target_os = "macos")]
 #[allow(unexpected_cfgs)] // objc0.2 expands its historical cargo-clippy cfg.
 mod native {
@@ -184,8 +221,14 @@ mod native {
     const MASK: u32 = u32::from_be_bytes(*b"L008");
     #[link(name = "Vision", kind = "framework")]
     unsafe extern "C" {}
+    #[link(name = "Metal", kind = "framework")]
+    unsafe extern "C" {
+        fn MTLCreateSystemDefaultDevice() -> *mut Object;
+    }
     #[link(name = "CoreImage", kind = "framework")]
     unsafe extern "C" {
+        static kCIContextUseSoftwareRenderer: *mut Object;
+        static kCIContextPriorityRequestLow: *mut Object;
         static kCIContextWorkingColorSpace: *mut Object;
         static kCIContextOutputColorSpace: *mut Object;
         static kCIContextWorkingFormat: *mut Object;
@@ -195,6 +238,8 @@ mod native {
     }
     #[link(name = "CoreVideo", kind = "framework")]
     unsafe extern "C" {
+        static kCVPixelBufferIOSurfacePropertiesKey: *mut Object;
+        static kCVPixelBufferMetalCompatibilityKey: *mut Object;
         fn CVPixelBufferCreate(
             allocator: *const c_void,
             width: usize,
@@ -447,6 +492,7 @@ mod native {
             unsafe {
                 let _pool = Pool::new();
                 let (r, s, a) = Native::sequence()?;
+                let _: () = msg_send![r.0, setPreferBackgroundProcessing:YES];
                 Ok(Self {
                     request: r,
                     sequence: s,
@@ -459,6 +505,7 @@ mod native {
             unsafe {
                 let _pool = Pool::new();
                 let (r, s, a) = Native::sequence()?;
+                let _: () = msg_send![r.0, setPreferBackgroundProcessing:YES];
                 self.request = r;
                 self.sequence = s;
                 self.requests = a;
@@ -561,6 +608,200 @@ mod native {
         context: Owned,
         options: Owned,
         frames: Option<Frames>,
+    }
+
+    pub(super) struct CameraCropper {
+        context: Owned,
+        output: Option<((u32, u32), Pixel)>,
+    }
+    impl CameraCropper {
+        pub(super) fn new() -> Result<Self, String> {
+            unsafe {
+                let _pool = Pool::new();
+                let device = Owned::new(MTLCreateSystemDefaultDevice(), "Metal indisponível")?;
+                let null: *mut Object = msg_send![class!(NSNull), null];
+                let no: *mut Object = msg_send![class!(NSNumber), numberWithBool:objc::runtime::NO];
+                let format: *mut Object = msg_send![class!(NSNumber), numberWithInt:kCIFormatRGBA8];
+                let options = dictionary(
+                    &[
+                        kCIContextWorkingColorSpace,
+                        kCIContextOutputColorSpace,
+                        kCIContextWorkingFormat,
+                        kCIContextCacheIntermediates,
+                        kCIContextUseSoftwareRenderer,
+                        kCIContextPriorityRequestLow,
+                    ],
+                    &[null, null, format, no, no, no],
+                );
+                let context = Owned::retain(
+                    msg_send![class!(CIContext), contextWithMTLDevice:device.0 options:options],
+                    "GPU de recorte",
+                )?;
+                Ok(Self {
+                    context,
+                    output: None,
+                })
+            }
+        }
+        pub(super) unsafe fn crop(
+            &mut self,
+            buffer: *mut c_void,
+            size: (u32, u32),
+            canvas: (u32, u32),
+            matrix: [f64; 8],
+            pixels: &mut Vec<u8>,
+        ) -> Result<(), String> {
+            let _pool = Pool::new();
+            let roi = crate::transform::camera_roi(size, canvas, matrix)?;
+            if buffer.is_null()
+                || CVPixelBufferGetWidth(buffer) != size.0 as usize
+                || CVPixelBufferGetHeight(buffer) != size.1 as usize
+            {
+                return Err("Buffer da câmera inválido para recorte".into());
+            }
+            if self.output.as_ref().is_none_or(|(s, _)| *s != canvas) {
+                let empty: *mut Object = msg_send![class!(NSDictionary), dictionary];
+                let yes: *mut Object = msg_send![class!(NSNumber), numberWithBool:YES];
+                let attrs = dictionary(
+                    &[
+                        kCVPixelBufferIOSurfacePropertiesKey,
+                        kCVPixelBufferMetalCompatibilityKey,
+                    ],
+                    &[empty, yes],
+                );
+                let mut pixel = ptr::null_mut();
+                let status = CVPixelBufferCreate(
+                    ptr::null(),
+                    canvas.0 as usize,
+                    canvas.1 as usize,
+                    BGRA,
+                    attrs.cast(),
+                    &mut pixel,
+                );
+                check(status as isize, "superfície de recorte")?;
+                if pixel.is_null() {
+                    return Err("Superfície de recorte ausente".into());
+                }
+                self.output = Some((canvas, Pixel(pixel)));
+            }
+            let image: *mut Object = msg_send![class!(CIImage), imageWithCVPixelBuffer:buffer];
+            let rect = CropRect {
+                x: roi.x as f64,
+                y: (size.1 as usize - roi.y - roi.height) as f64,
+                width: roi.width as f64,
+                height: roi.height as f64,
+            };
+            let image: *mut Object = msg_send![image, imageByCroppingToRect:rect];
+            let move_to_origin = Affine {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                tx: -rect.x,
+                ty: -rect.y,
+            };
+            let image: *mut Object = msg_send![image, imageByApplyingTransform:move_to_origin];
+            let filter: *mut Object =
+                msg_send![class!(CIFilter), filterWithName:key("CILanczosScaleTransform")];
+            let sy = f64::from(canvas.1) / rect.height;
+            let sx = f64::from(canvas.0) / rect.width;
+            let scale: *mut Object = msg_send![class!(NSNumber), numberWithDouble:sy];
+            let aspect: *mut Object = msg_send![class!(NSNumber), numberWithDouble:sx / sy];
+            let _: () = msg_send![filter, setValue:image forKey:key("inputImage")];
+            let _: () = msg_send![filter, setValue:scale forKey:key("inputScale")];
+            let _: () = msg_send![filter, setValue:aspect forKey:key("inputAspectRatio")];
+            let mut image: *mut Object = msg_send![filter, outputImage];
+            if roi.mirror {
+                let flip = Affine {
+                    a: -1.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 1.0,
+                    tx: f64::from(canvas.0),
+                    ty: 0.0,
+                };
+                image = msg_send![image, imageByApplyingTransform:flip];
+            }
+            if image.is_null() {
+                return Err("GPU não produziu o recorte".into());
+            }
+            let output = &self.output.as_ref().ok_or("Recorte indisponível")?.1;
+            let _: () = msg_send![self.context.0, render:image toCVPixelBuffer:output.0];
+            let lock = Locked::new(output.0)?;
+            let view = lock.view();
+            let row = canvas.0 as usize * 4;
+            pixels.resize(row * canvas.1 as usize, 0);
+            for (y, destination) in pixels.chunks_exact_mut(row).enumerate() {
+                destination.copy_from_slice(std::slice::from_raw_parts(
+                    (view.data as *const u8).add(y * view.row_bytes),
+                    row,
+                ));
+            }
+            Ok(())
+        }
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CropRect {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    }
+    unsafe impl Encode for CropRect {
+        fn encode() -> Encoding {
+            unsafe { Encoding::from_str("{CGRect={CGPoint=dd}{CGSize=dd}}") }
+        }
+    }
+    #[test]
+    #[ignore = "requires a Metal device"]
+    fn gpu_crop_preserves_selected_camera_roi_and_channel_order() {
+        unsafe {
+            let _pool = Pool::new();
+            let input = Pixel::new(16, 8, BGRA).unwrap();
+            {
+                let lock = Locked::new(input.0).unwrap();
+                let view = lock.view();
+                for y in 0..8 {
+                    let row = std::slice::from_raw_parts_mut(
+                        (view.data as *mut u8).add(y * view.row_bytes),
+                        64,
+                    );
+                    for x in 0..16 {
+                        row[x * 4..x * 4 + 4].copy_from_slice(&[
+                            100,
+                            (y * 20) as u8,
+                            (x * 10) as u8,
+                            255,
+                        ]);
+                    }
+                }
+            }
+            let mut cropper = CameraCropper::new().unwrap();
+            let mut rgb = Vec::new();
+            cropper
+                .crop(
+                    input.0,
+                    (16, 8),
+                    (8, 4),
+                    [7.0 / 15.0, 0.0, 8.0 / 15.0, 0.0, 3.0 / 7.0, 0.0, 0.0, 0.0],
+                    &mut rgb,
+                )
+                .unwrap();
+            assert_eq!(&rgb[..4], &[100, 0, 80, 255]);
+            assert_eq!(&rgb[rgb.len() - 4..], &[100, 60, 150, 255]);
+            cropper
+                .crop(
+                    input.0,
+                    (16, 8),
+                    (16, 8),
+                    [-1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                    &mut rgb,
+                )
+                .unwrap();
+            assert_eq!(&rgb[..4], &[100, 0, 150, 255]);
+            assert_eq!(&rgb[rgb.len() - 4..], &[100, 140, 0, 255]);
+        }
     }
     #[cfg(test)]
     pub(super) fn compose_fixture(
@@ -718,6 +959,14 @@ mod native {
                 Ok(image)
             }
         }
+        unsafe fn exposure(image: *mut Object, ev: f64) -> *mut Object {
+            let filter: *mut Object =
+                msg_send![class!(CIFilter), filterWithName:key("CIExposureAdjust")];
+            let amount: *mut Object = msg_send![class!(NSNumber), numberWithDouble:ev];
+            let _: () = msg_send![filter, setValue:image forKey:key("inputImage")];
+            let _: () = msg_send![filter, setValue:amount forKey:key("inputEV")];
+            msg_send![filter, outputImage]
+        }
         unsafe fn composite(
             &self,
             input: *mut Object,
@@ -746,6 +995,8 @@ mod native {
             h: u32,
             mut rgb: Vec<u8>,
             amount: f32,
+            backdrop: Option<[u8; 3]>,
+            light: bool,
         ) -> Result<(Vec<u8>, Stats), String> {
             unsafe {
                 let _pool = Pool::new();
@@ -817,10 +1068,25 @@ mod native {
                 let segmentation_ms = segment_start.elapsed().as_secs_f64() * 1000.0;
                 let compose = Instant::now();
                 let input = self.image(f.input.0)?;
-                let clamped: *mut Object = msg_send![input, imageByClampingToExtent];
-                let radius = f64::from(amount) * 24.0 * (f64::from(h) / 1080.0).max(0.5);
-                let background: *mut Object =
-                    msg_send![clamped,imageByApplyingGaussianBlurWithSigma:radius];
+                let mut background: *mut Object = if let Some([r, g, b]) = backdrop {
+                    let color: *mut Object = msg_send![class!(CIColor),
+                        colorWithRed:f64::from(r) / 255.0 green:f64::from(g) / 255.0 blue:f64::from(b) / 255.0 alpha:1.0f64];
+                    msg_send![class!(CIImage), imageWithColor:color]
+                } else if amount > 0.0 {
+                    let clamped: *mut Object = msg_send![input, imageByClampingToExtent];
+                    let radius = f64::from(amount) * 24.0 * (f64::from(h) / 1080.0).max(0.5);
+                    msg_send![clamped, imageByApplyingGaussianBlurWithSigma:radius]
+                } else {
+                    input
+                };
+                let foreground = if light {
+                    if backdrop.is_none() {
+                        background = Self::exposure(background, 0.75f64.log2());
+                    }
+                    Self::exposure(input, 1.25f64.log2())
+                } else {
+                    input
+                };
                 let mask_image = self.image(mask)?;
                 let affine = Affine {
                     a: f64::from(w) / mw as f64,
@@ -834,7 +1100,7 @@ mod native {
                 if background.is_null() || mask_image.is_null() {
                     return Err("Core Image não gerou as imagens de desfoque".into());
                 }
-                self.composite(input, background, mask_image, f.output.0)?;
+                self.composite(foreground, background, mask_image, f.output.0)?;
                 {
                     let out = Locked::new(f.output.0)?;
                     let dest = Buffer {

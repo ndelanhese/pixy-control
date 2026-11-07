@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add eight local gesture reactions, manual reaction controls, solid backgrounds, studio lighting and a click-through screen light.
+- Resample the bounded call crop with Metal and compose lighting with Apple Silicon vector instructions.
+- Keep the USB wake grace period available after the macOS camera consent dialog.
+
 - Isolate physical-camera processing from the AVFoundation callback using a bounded latest-frame mailbox and preserve delivery QoS; four of five 4K/strong-blur/hidden-window cadence tests passed, including the confirmed 720p output.
 
 - Use bounded native live-call framing and blur with asynchronous person segmentation when the local window is inactive. Preserve full-resolution photos and recordings.

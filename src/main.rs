@@ -16,6 +16,7 @@ mod meter;
 mod model;
 mod preview;
 mod quad;
+mod reactions;
 mod recording;
 mod sharing_check;
 mod sharing_usage;

@@ -22,6 +22,14 @@ Mantenha o Pixy Control aberto; ele pode ficar em segundo plano. A saída da ext
 
 Enquadramento, blur e preferências da aplicação são salvos automaticamente. Os controles físicos continuam sendo enviados diretamente à câmera; não há um formato global de captura que obrigue todos os aplicativos a usar4K.
 
+### Efeitos locais
+
+Em **Efeitos**, você pode ativar reações por gestos, iluminação de estúdio, fundo de cor sólida e luz de borda da tela. Segure o gesto por cerca de meio segundo e solte antes de repetir. O menu **Pixy → Enviar reação** também permite disparar a animação com a janela fechada.
+
+Selecione **EMEET STUDIO Virtual Camera** no Teams ou no Meet para receber o vídeo processado. O fundo sólido substitui o blur enquanto estiver selecionado. A luz de borda ilumina pela tela e apaga quando a captura para.
+
+A exposição automática da PIXY variou a cadência durante os testes. A exposição fixa de 30 ms passou nas duas rodadas de 4K30 com blur e reações. [Medições e tabela de gestos](LOCAL-EFFECTS.md)
+
 ### Privacidade por uso real
 
 Em **V-Cam → Privacidade automática**, o app aguarda3segundos de ociosidade confirmada e seleciona o modo Privacidade. Quando uma câmera virtual é solicitada, retoma o modo Manual ou Rastreamento anterior e o enquadramento configurado. A prévia local enquanto você ajusta a câmera e a gravação também contam como uso. A opção **Ocultar prévia** permite deixar o app na frente sem manter essa prévia como consumidora.
