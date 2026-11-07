@@ -62,6 +62,10 @@ impl Drop for Activity {
 pub fn prioritize_current_thread() -> Result<(), String> {
     set_thread_qos(0x19)
 }
+/// Match the AVFoundation delivery queue for deadline-bound frame processing.
+pub fn prioritize_delivery_thread() -> Result<(), String> {
+    set_thread_qos(0x21)
+}
 fn set_thread_qos(qos: u32) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -85,7 +89,7 @@ pub fn prioritize_metadata_thread() -> Result<(), String> {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     #[test]
-    fn metadata_uses_utility_qos_without_changing_the_calling_thread() {
+    fn video_and_metadata_qos_do_not_change_the_calling_thread() {
         unsafe extern "C" {
             fn pthread_self() -> *mut std::ffi::c_void;
             fn pthread_get_qos_class_np(
@@ -103,6 +107,16 @@ mod tests {
             );
             qos
         };
+        let video_class = std::thread::spawn(move || {
+            super::prioritize_delivery_thread().unwrap();
+            class()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            video_class, 0x21,
+            "delivery must retain the original AVFoundation interactive QoS"
+        );
         let before = class();
         let worker_class = std::thread::spawn(move || {
             super::prioritize_metadata_thread().unwrap();

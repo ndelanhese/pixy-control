@@ -1185,7 +1185,12 @@ mod native {
         let worker = if matches!(target, Target::PhysicalPixy) {
             let state = shared.clone();
             Some(thread::spawn(move || {
-                let _ = crate::video_activity::prioritize_current_thread();
+                if let Err(error) = crate::video_activity::prioritize_delivery_thread() {
+                    if let Ok(mut failure) = state.failure.lock() {
+                        *failure = Some(error);
+                    }
+                    return;
+                }
                 while let Some(sample) = state.incoming.take() {
                     process_sample(&state, sample.buffer, sample.received);
                 }
