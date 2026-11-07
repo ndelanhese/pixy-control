@@ -6,6 +6,7 @@ mod controller;
 mod diagnostics;
 mod exposure;
 mod fluency_check;
+mod frame_mailbox;
 mod hardware_check;
 mod hid;
 mod lifecycle;

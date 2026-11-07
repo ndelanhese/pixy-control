@@ -86,6 +86,8 @@ struct Shared {
     live_only: AtomicBool,
     #[cfg(target_os = "macos")]
     live_processor: Mutex<Option<crate::live_blur::Processor>>,
+    #[cfg(target_os = "macos")]
+    incoming: crate::frame_mailbox::Mailbox<native::Sample>,
     processing: Mutex<std::collections::VecDeque<ProcessingSample>>,
 }
 impl Shared {
@@ -116,6 +118,8 @@ impl Shared {
             live_only: AtomicBool::new(false),
             #[cfg(target_os = "macos")]
             live_processor: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            incoming: crate::frame_mailbox::Mailbox::default(),
             processing: Mutex::new(std::collections::VecDeque::new()),
         }
     }
@@ -411,6 +415,11 @@ mod native {
         static AVMediaTypeVideo: *mut Object;
         static AVCaptureDeviceTypeExternal: *mut Object;
         static AVCaptureSessionPresetInputPriority: *mut Object;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRetain(value: *const c_void) -> *const c_void;
+        fn CFRelease(value: *const c_void);
     }
     #[link(name = "CoreMedia", kind = "framework")]
     extern "C" {
@@ -714,6 +723,20 @@ mod native {
         cache.len() - 1
     }
 
+    // A retained CMSampleBuffer owns its immutable pixel buffer across threads.
+    // Never move a borrowed AVFoundation callback pointer to another thread.
+    pub(super) struct Sample {
+        buffer: *mut c_void,
+        received: Instant,
+    }
+    unsafe impl Send for Sample {}
+    impl Drop for Sample {
+        fn drop(&mut self) {
+            unsafe {
+                CFRelease(self.buffer);
+            }
+        }
+    }
     extern "C" fn frame_callback(
         this: &Object,
         _: Sel,
@@ -721,15 +744,31 @@ mod native {
         sample: *mut c_void,
         _: *mut Object,
     ) {
-        // Never unwind into AVFoundation. A callback sees an Arc owned by this delegate;
-        // the queue is drained before releasing the delegate during shutdown.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             let pointer = *this.get_ivar::<usize>("rustState") as *const Shared;
-            if pointer.is_null() {
+            if pointer.is_null() || sample.is_null() {
                 return;
             }
             let state = &*pointer;
-            if state.cancelled.load(Ordering::Acquire) || sample.is_null() {
+            if state.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let received = Instant::now();
+            if state.virtual_target.load(Ordering::Acquire) {
+                process_sample(state, sample, received);
+            } else {
+                CFRetain(sample);
+                state.incoming.submit(Sample {
+                    buffer: sample,
+                    received,
+                });
+            }
+        }));
+    }
+    fn process_sample(state: &Shared, sample: *mut c_void, received_at: Instant) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            let _pool = Pool::new();
+            if state.cancelled.load(Ordering::Acquire) {
                 return;
             }
             let buffer = CMSampleBufferGetImageBuffer(sample);
@@ -753,7 +792,6 @@ mod native {
             } else {
                 None
             };
-            let received_at = Instant::now();
             let mut sequence = 0;
             if let Ok(mut timing) = state.timing.lock() {
                 timing.frames += 1;
@@ -1051,6 +1089,8 @@ mod native {
         output: Owned,
         _delegate: Owned,
         queue: *mut c_void,
+        state: Arc<Shared>,
+        worker: Option<thread::JoinHandle<()>>,
     }
     impl Drop for Session {
         fn drop(&mut self) {
@@ -1061,6 +1101,10 @@ mod native {
                 // delegate releases its Arc. No UI thread joins or queue suspension.
                 dispatch_sync_f(self.queue, ptr::null_mut(), drained);
                 dispatch_release(self.queue);
+                self.state.incoming.close();
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
             }
         }
     }
@@ -1138,11 +1182,24 @@ mod native {
         if queue.is_null() {
             return Err("Falha ao criar fila de vídeo.".into());
         }
+        let worker = if matches!(target, Target::PhysicalPixy) {
+            let state = shared.clone();
+            Some(thread::spawn(move || {
+                let _ = crate::video_activity::prioritize_current_thread();
+                while let Some(sample) = state.incoming.take() {
+                    process_sample(&state, sample.buffer, sample.received);
+                }
+            }))
+        } else {
+            None
+        };
         let capture = Session {
             session,
             output,
             _delegate: delegate,
             queue,
+            state: shared.clone(),
+            worker,
         };
         let _: () = msg_send![capture.session.0, beginConfiguration];
         let can_input: BOOL = msg_send![capture.session.0, canAddInput:input.0];

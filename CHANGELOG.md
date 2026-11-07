@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Isolate physical-camera processing from the AVFoundation callback using a bounded latest-frame mailbox; hardware fluency verification is pending fresh camera permission for the rebuilt app.
+
 - Use bounded native live-call framing and blur with asynchronous person segmentation when the local window is inactive. Preserve full-resolution photos and recordings.
 - Establish native video priority before transport setup, preserve capture age, and bound the downstream queue.
 - Reduce active-video metadata reconnections while keeping idle wake detection fast.
